@@ -1,0 +1,20 @@
+# local_service/serve.py — a real stand-in for the Modules 1, 2 & 3 service.
+#
+# Separate from the main requirements.txt on purpose: the interface itself
+# (app.py) needs none of this. Only run this install where you plan to run
+# `uvicorn local_service.serve:app`.
+#
+#     pip install -r local_service/requirements.txt
+
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9      # required by FastAPI's File()/Form() parsing
+
+# Modules 1 & 2 need only opencv-python and numpy, already in the main
+# requirements.txt, plus the shared repository's image_pipeline.py itself
+# (imported from PCB_WORKSPACE — nothing to install for it).
+
+# Module 3. CPU works, is just slow; install the CUDA build of torch from
+# https://pytorch.org first if a GPU is present.
+ultralytics>=8.1
+torch>=2.0

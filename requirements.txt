@@ -1,0 +1,47 @@
+# Module 4 — User Interface Module
+# PCB Defect Inspection System
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# This repository holds Module 4 alone. In the default arrangement — Modules 1,
+# 2 and 3 all reached over HTTP — the block below is the whole dependency list,
+# and the interface runs on a machine with no PyTorch install at all.
+
+# --- Interface, data handling and reporting (required) --------------------- #
+streamlit>=1.41         # st.image(use_container_width=...) needs 1.41 or later
+opencv-python>=4.8      # image decode/encode and annotation, plus the camera
+                        # capture used by the Live page. Use
+                        # opencv-python-headless when deploying to a server
+                        # with no display.
+numpy>=1.24
+pandas>=2.0
+reportlab>=4.0          # PDF inspection reports
+requests>=2.28          # client for both upstream services (a Streamlit
+                        # dependency already, listed here so the need is explicit)
+
+# --- Module 3 inference backends (optional) -------------------------------- #
+# Required only when detection runs in this process
+# ("Detector source → Local checkpoint"). Ultralytics covers the YOLO and
+# RT-DETR checkpoints; torch/torchvision additionally cover the Faster R-CNN
+# checkpoint. Install the CUDA build of torch from https://pytorch.org if a GPU
+# is present — CPU inference works but is considerably slower.
+#
+# Leave these commented out when detection runs as a service, which is the
+# default and what makes deployment to a small host practical.
+# ultralytics>=8.1
+# torch>=2.0
+# torchvision>=0.15
+
+# --- Modules 1 & 2 local execution (optional) ------------------------------ #
+# Required only for "Processing pipeline → Local module", which imports
+# image_pipeline.py from a checkout of the shared repository. That code needs
+# nothing beyond opencv-python and numpy above, except for notebook execution
+# mode, which parses the teammates' .ipynb files.
+# nbformat>=5.9
+
+# --- Optional: shared inspection history ---------------------------------- #
+# Only needed for the Supabase history store. The default store is SQLite, which
+# ships with Python and needs nothing installed. Uncomment to enable Supabase,
+# and run docs/supabase_schema.sql in the Supabase SQL editor first.
+# supabase>=2.4

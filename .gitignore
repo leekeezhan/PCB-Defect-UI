@@ -1,0 +1,46 @@
+# --- Python ---------------------------------------------------------------- #
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Run data, not source --------------------------------------------------- #
+# The SQLite inspection history is produced by running the application.
+*.db
+*.db-journal
+inspection_history.db
+
+# --- Model checkpoints ------------------------------------------------------ #
+# Detection normally runs as a service, so no checkpoint belongs here. A copy
+# dropped in for offline work is still run data and stays out of the repository.
+weights/
+runs/
+*.pt
+*.pth
+
+# --- Image data ------------------------------------------------------------- #
+# This repository holds Module 4 only. Datasets live with the modules that
+# produce them; the sample-data folder in the sidebar points at those instead.
+PCB_DATASET/
+Clean_Dataset/
+Preprocessed_Dataset/
+Calibrated_Dataset/
+samples/
+sample_images/
+*.mp4
+*.avi
+
+# --- Local configuration ---------------------------------------------------- #
+.env
+.streamlit/secrets.toml
+
+# --- Editors and operating systems ------------------------------------------ #
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
