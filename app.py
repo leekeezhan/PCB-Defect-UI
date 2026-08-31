@@ -64,7 +64,7 @@ import streamlit as st
 
 from core import analysis, live, report, storage, video, viz
 from core.analysis import BatchSummary, InspectionSummary
-from core.detector import DefectDetector
+from core.detector import DefectDetector, filter_by_class
 from core.pipeline_bridge import (
     create_pipeline,
     decode_image,
@@ -220,6 +220,12 @@ def inspect(image, bridge: Pipeline, detector, settings: Settings):
     detection_result = detector.predict(
         stages.final, confidence=settings.confidence, iou=settings.iou
     )
+    # A defect type the operator unchecked in "Defect types to show" is
+    # dropped here, before the verdict, the score, the image or the table
+    # ever see it — filtering only the display would leave a hidden type
+    # still able to fail the board, which would be confusing. An empty
+    # selection is honoured literally too: it means "show nothing".
+    detection_result = filter_by_class(detection_result, settings.visible_classes)
     summary = analysis.summarise(detection_result, settings.criteria)
     annotated = viz.draw_detections(
         stages.final,

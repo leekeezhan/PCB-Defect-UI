@@ -91,6 +91,14 @@ class Settings:
 
     class_names: tuple[str, ...] = field(default_factory=tuple)
 
+    # -- which classes are shown at all --------------------------------------- #
+    #: A defect type left out of this tuple is dropped before anything sees it
+    #: — the verdict, the quality score, the annotated image, the findings
+    #: table. Empty means "show nothing", not "show everything"; the sidebar
+    #: defaults it to every known class so the out-of-the-box behaviour is
+    #: unchanged until the operator narrows it deliberately.
+    visible_classes: tuple[str, ...] = field(default_factory=tuple)
+
     # -- helpers ------------------------------------------------------------ #
     @property
     def uses_remote(self) -> bool:
@@ -191,7 +199,7 @@ def render_sidebar() -> Settings:
 
         detector = _detector_section(root)
         thresholds = _threshold_section()
-        criteria, available_classes = _criteria_section(root)
+        criteria, available_classes, visible_classes = _criteria_section(root)
         display = _display_section()
         history = _history_section(root)
 
@@ -210,6 +218,7 @@ def render_sidebar() -> Settings:
         **display,
         **history,
         class_names=tuple(available_classes),
+        visible_classes=visible_classes,
     )
 
 
@@ -547,22 +556,34 @@ def _workspace_section() -> dict[str, Any]:
     return {"workspace": folder}
 
 
-def _criteria_section(root: Path | None) -> tuple[InspectionCriteria, tuple[str, ...]]:
+def _criteria_section(root: Path | None) -> tuple[InspectionCriteria, tuple[str, ...], tuple[str, ...]]:
     """What counts as an acceptable board."""
     st.divider()
     st.markdown("**Acceptance criteria**")
+    available_classes = read_class_names_from_yaml(root) or tuple(DEFAULT_SEVERITY)
+    visible_classes = st.multiselect(
+        "Defect types to show",
+        options=list(available_classes),
+        default=list(available_classes),
+        help="A defect type left unchecked here is treated as if it had never "
+             "been detected — dropped before the verdict, the quality score, "
+             "the annotated image and the findings table. Leave everything "
+             "checked to see every class the detector reports.",
+    )
     max_defects = st.number_input(
         "Defects allowed per board", min_value=0, max_value=50, value=0, step=1,
         help="A board carrying more confident defects than this is failed. Zero "
-             "is a zero-tolerance policy.",
+             "is a zero-tolerance policy. Only counts the defect types selected "
+             "above.",
     )
-    available_classes = read_class_names_from_yaml(root) or tuple(DEFAULT_SEVERITY)
     critical_classes = st.multiselect(
         "Critical defect types",
         options=list(available_classes),
         default=[c for c in DEFAULT_CRITICAL_CLASSES if c in available_classes],
         help="These fail a board on sight, whatever the allowance, because they "
-             "break electrical continuity.",
+             "break electrical continuity. Only takes effect for types also "
+             "selected above — a type hidden from view can't fail a board "
+             "either.",
     )
     review_confidence = st.slider(
         "Manual-review confidence", 0.10, 0.95, 0.50, 0.05,
@@ -575,7 +596,7 @@ def _criteria_section(root: Path | None) -> tuple[InspectionCriteria, tuple[str,
         critical_classes=tuple(critical_classes),
         review_confidence=float(review_confidence),
     )
-    return criteria, available_classes
+    return criteria, available_classes, tuple(visible_classes)
 
 
 def _display_section() -> dict[str, Any]:
