@@ -141,49 +141,6 @@ def filter_by_class(result: DetectionResult, keep: Iterable[str] | None) -> Dete
     )
 
 
-#: Two boxes overlapping at least this much are treated as the same physical
-#: defect, whatever classes they were each labelled with.
-_DEDUPLICATE_IOU = 0.5
-
-
-def _box_iou(a: Detection, b: Detection) -> float:
-    """Intersection-over-union of two boxes, ignoring their predicted class."""
-    x1, y1 = max(a.x1, b.x1), max(a.y1, b.y1)
-    x2, y2 = min(a.x2, b.x2), min(a.y2, b.y2)
-    if x2 <= x1 or y2 <= y1:
-        return 0.0
-    intersection = (x2 - x1) * (y2 - y1)
-    area_a = max(0.0, a.x2 - a.x1) * max(0.0, a.y2 - a.y1)
-    area_b = max(0.0, b.x2 - b.x1) * max(0.0, b.y2 - b.y1)
-    union = area_a + area_b - intersection
-    return intersection / union if union > 0 else 0.0
-
-
-def deduplicate(
-    detections: list[Detection], iou_threshold: float = _DEDUPLICATE_IOU
-) -> list[Detection]:
-    """
-    Collapse detections that describe the same physical defect twice.
-
-    The model's own non-maximum suppression only compares boxes *within* the
-    same predicted class, so two boxes at (almost) the same location survive
-    together whenever they were given different class guesses — and,
-    occasionally, even two near-identical boxes of the *same* class slip past
-    it. Either way they get drawn stacked on top of each other and counted
-    twice, even though a single physical defect should produce one finding.
-
-    This keeps only the highest-confidence detection in each cluster of
-    heavily overlapping boxes, regardless of what class each was given.
-    Returned in descending order of confidence.
-    """
-    ordered = sorted(detections, key=lambda d: d.confidence, reverse=True)
-    kept: list[Detection] = []
-    for candidate in ordered:
-        if not any(_box_iou(candidate, existing) >= iou_threshold for existing in kept):
-            kept.append(candidate)
-    return kept
-
-
 # --------------------------------------------------------------------------- #
 # Weight discovery
 # --------------------------------------------------------------------------- #
@@ -466,10 +423,6 @@ class DefectDetector:
             A :class:`DetectionResult`. When no model is loaded, the result is
             empty and carries the loading error, so the interface can show the
             processing stages and simply report that detection was unavailable.
-            The returned detections have also been passed through
-            :func:`deduplicate`, so two overlapping boxes for the same
-            physical defect — whether given the same class or two different
-            ones — never both appear.
         """
         height, width = image.shape[:2]
         if not self.available:
@@ -488,7 +441,7 @@ class DefectDetector:
             )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
 
-        detections = deduplicate(detections)
+        detections.sort(key=lambda d: d.confidence, reverse=True)
         return DetectionResult(detections, elapsed_ms, (height, width), self.model_name)
 
     def _predict_ultralytics(
