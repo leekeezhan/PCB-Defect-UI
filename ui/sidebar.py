@@ -488,7 +488,7 @@ def _pipeline_remote_picker() -> dict[str, Any]:
     """Collect the processing service's address and credentials."""
     url = st.text_input(
         "Pipeline service base URL",
-        value=st.session_state.get("_pipeline_url", "http://127.0.0.1:8100"),
+        value=st.session_state.get("_pipeline_url", "http://127.0.0.1:8000"),
         key="_pipeline_url",
         help="The service root, not an endpoint — the client appends /health and "
              "/process itself. See docs/API_CONTRACT_PIPELINE.md.",

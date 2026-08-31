@@ -163,6 +163,20 @@ def discover_weights(project_root: Path | None) -> list[Path]:
     return found
 
 
+#: Exact filenames Ultralytics ships pre-trained on COCO. Matched by full
+#: equality rather than by prefix — a fine-tuned checkpoint such as
+#: ``rtdetr_l_pcb.pt`` or ``yolov10n_pcb.pt`` starts with the same prefix as
+#: its stock parent but is not one of these, and must not be flagged as stock.
+_STOCK_CHECKPOINT_STEMS = frozenset({
+    "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
+    "yolov9c", "yolov9e",
+    "yolov10n", "yolov10s", "yolov10m", "yolov10b", "yolov10l", "yolov10x",
+    "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x",
+    "yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x",
+    "rtdetr-l", "rtdetr-x",
+})
+
+
 def is_pretrained_stock(path: Path) -> bool:
     """
     True when ``path`` looks like a stock COCO download rather than a checkpoint
@@ -170,8 +184,7 @@ def is_pretrained_stock(path: Path) -> bool:
     will not be defect names.
     """
     stem = path.stem.lower()
-    stock_prefixes = ("yolov", "yolo1", "yolo8", "yolon", "rtdetr", "yolo11", "yolo26")
-    return path.parent.name != "weights" and stem.startswith(stock_prefixes)
+    return path.parent.name != "weights" and stem in _STOCK_CHECKPOINT_STEMS
 
 
 def read_class_names_from_yaml(project_root: Path | None) -> tuple[str, ...] | None:
