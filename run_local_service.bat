@@ -12,7 +12,11 @@ REM newer weights file from a teammate), just edit the two "set" lines below.
 setlocal
 
 set "PCB_WORKSPACE=C:\Users\leekeezhan\Image-Processing"
-set "PCB_WEIGHTS=C:\Users\leekeezhan\Image-Processing\Student3-Defect Detection\models\rtdetr_l_pcb.pt"
+set "PCB_WEIGHTS=C:\Users\leekeezhan\Image-Processing\Student3-Defect Detection\faster_rcnn\best.pt"
+
+REM To go back to the RT-DETR-L model, comment the line above (add REM in
+REM front) and uncomment this one instead:
+REM set "PCB_WEIGHTS=C:\Users\leekeezhan\Image-Processing\Student3-Defect Detection\runs\rtdetr-l_pcb\weights\best.pt"
 
 REM Always run from the folder this .bat file lives in, no matter where it
 REM was double-clicked from.

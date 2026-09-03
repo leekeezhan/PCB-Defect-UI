@@ -48,6 +48,19 @@ def verdict_banner(summary: InspectionSummary) -> None:
     )
 
 
+def _align_effective(stages: StageResult) -> bool:
+    """
+    Whether Module 2 actually changed the image's geometry.
+
+    Delegates to ``StageResult.align_effective``, tolerating its absence: the
+    pipeline adapter is held by ``@st.cache_resource``, so right after this
+    property is added to the code a cached adapter can still produce instances
+    of the previously imported class. Treating that as "effective" keeps the
+    old wording until the server is restarted, instead of raising.
+    """
+    return bool(getattr(stages, "align_effective", True))
+
+
 def stage_chips(stages: StageResult, detector_ready: bool) -> None:
     """
     Show which pipeline stages actually ran on this image.
@@ -67,9 +80,19 @@ def stage_chips(stages: StageResult, detector_ready: bool) -> None:
             "Module 1 · Pre-processing " + ("✓" if stages.preprocess_ok else "skipped"),
             "ok" if stages.preprocess_ok else "off",
         ),
+        # Module 2 has three outcomes worth distinguishing, not two: it can
+        # straighten the board, it can return a board outline that is already
+        # square to the camera (so the image is only rescaled — see
+        # StageResult.align_effective), or it can find no outline at all.
+        # Read defensively: a StageResult built by a pipeline adapter that
+        # Streamlit cached before this attribute existed would otherwise raise.
         chip(
-            "Module 2 · Alignment " + ("✓" if stages.align_ok else "not applied"),
-            "ok" if stages.align_ok else "warn",
+            "Module 2 · Alignment " + (
+                "✓" if stages.align_ok and _align_effective(stages)
+                else "rescaled only" if stages.align_ok
+                else "not applied"
+            ),
+            "ok" if stages.align_ok and _align_effective(stages) else "warn",
         ),
         chip(
             "Module 3 · Detection " + ("✓" if detector_ready else "unavailable"),

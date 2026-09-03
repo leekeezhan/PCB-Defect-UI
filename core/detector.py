@@ -297,10 +297,22 @@ class DefectDetector:
     def _load(self) -> None:
         """Choose a backend from the checkpoint and load it."""
         suffix = self.weights_path.suffix.lower()
-        if suffix == ".pth":
+        if suffix == ".pth" or self._looks_like_torchvision_path():
             self._load_torchvision()
         else:
             self._load_ultralytics()
+
+    def _looks_like_torchvision_path(self) -> bool:
+        """
+        Recognise a Faster R-CNN checkpoint even when it was saved with a
+        ``.pt`` extension. Module 3 saves it as ``faster_rcnn/best.pt`` — same
+        extension as the Ultralytics checkpoints, but the wrong loader entirely
+        (Ultralytics' ``YOLO(...)`` cannot read a torchvision state dict). The
+        containing folder name is the reliable signal, so it is checked
+        alongside the ``.pth`` suffix rather than instead of it.
+        """
+        parts = {p.lower() for p in self.weights_path.parts}
+        return "faster_rcnn" in parts or "fasterrcnn" in parts
 
     def _load_ultralytics(self) -> None:
         """Load a YOLO or RT-DETR checkpoint through the Ultralytics API."""
@@ -362,13 +374,24 @@ class DefectDetector:
             if hasattr(state, "eval"):          # a whole pickled model was saved
                 model = state
             else:                               # a state dictionary was saved
-                anchor_sizes = ((8,), (16,), (32,), (64,), (128,))
-                aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+                # weights_backbone=None: skip fetching ImageNet backbone weights
+                # from the network — load_state_dict below overwrites every
+                # parameter anyway, and Module 3's own notebook documents this
+                # exact download failing on campus/office networks.
                 model = fasterrcnn_resnet50_fpn_v2(
                     weights=None,
+                    weights_backbone=None,
                     num_classes=len(self.class_names) + 1,   # +1 for background
-                    rpn_anchor_generator=AnchorGenerator(anchor_sizes, aspect_ratios),
                 )
+                # torchvision's v2 builder already supplies its own
+                # rpn_anchor_generator internally, so passing one as a
+                # constructor kwarg raises "got multiple values for keyword
+                # argument 'rpn_anchor_generator'". Module 3's own training
+                # notebook works around this the same way: build with the
+                # default anchors, then swap the attribute afterwards.
+                anchor_sizes = ((8,), (16,), (32,), (64,), (128,))
+                aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+                model.rpn.anchor_generator = AnchorGenerator(anchor_sizes, aspect_ratios)
                 model.load_state_dict(state)
 
             model.eval()

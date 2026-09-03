@@ -63,6 +63,13 @@ MODES = (MODE_MODULE, MODE_NOTEBOOK)
 SOURCE_LOCAL = "local"
 SOURCE_REMOTE = "remote"
 
+#: Mean absolute pixel difference (0-255) below which Module 2's output is
+#: treated as geometrically identical to its input — see
+#: :attr:`StageResult.align_effective`. Measured separation on the conveyor
+#: footage is ~3 for a no-op and ~30-50 for a real perspective correction, so
+#: the threshold sits well clear of both.
+_ALIGN_NOOP_TOLERANCE = 8.0
+
 
 # --------------------------------------------------------------------------- #
 # Locating and importing the shared contract
@@ -165,6 +172,41 @@ class StageResult:
     @property
     def align_ok(self) -> bool:
         return self.aligned is not None
+
+    @property
+    def align_effective(self) -> bool:
+        """
+        True when Module 2's output is geometrically *different* from its input.
+
+        Module 2 can report success and still hand back what is only a rescaled
+        copy of what it was given. Its corner detector takes the largest
+        contour in the frame and reduces it to four points; when the strongest
+        rectangle in the picture is already square to the camera — the pale
+        carrier card the boards sit on in the conveyor footage, for instance,
+        rather than the tilted board resting on it — the four corners it finds
+        are that rectangle's, and warping an upright rectangle to an upright
+        rectangle changes nothing but the resolution.
+
+        ``align_ok`` cannot tell the two apart: both are a non-``None``
+        ``aligned``. This compares the two arrays instead, so the interface can
+        say honestly that a board was rescaled rather than straightened.
+        """
+        if self.aligned is None:
+            return False
+        source = self.preprocessed if self.preprocessed is not None else self.original
+        if source is None:
+            return False
+
+        import cv2
+
+        height, width = self.aligned.shape[:2]
+        rescaled = cv2.resize(source, (width, height), interpolation=cv2.INTER_AREA)
+        if rescaled.shape != self.aligned.shape:
+            return True
+        difference = np.mean(
+            np.abs(rescaled.astype(np.int16) - self.aligned.astype(np.int16))
+        )
+        return float(difference) > _ALIGN_NOOP_TOLERANCE
 
 
 # --------------------------------------------------------------------------- #
@@ -278,6 +320,27 @@ class PipelineBridge:
         except Exception:                  # noqa: BLE001
             return None
 
+    def _scale_to_align_target(self, image: np.ndarray) -> np.ndarray:
+        """
+        Resize a whole frame to the same longest-side target a successful
+        Module 2 alignment would produce (``image_pipeline.ALIGN_TARGET``).
+
+        Used when alignment fails to resolve a boundary: without this, the
+        un-aligned frame reaches the detector at its own native resolution,
+        which can be a very different scale from what the detector was
+        trained on. Mirrors the fallback branch of
+        ``image_pipeline.detection_input()``, the function Module 3 documents
+        as the one true source of detector input for both training and
+        inference.
+        """
+        import cv2
+
+        target = getattr(self._module, "ALIGN_TARGET", 1280) if self._module else 1280
+        height, width = image.shape[:2]
+        scale = target / max(width, height)
+        out_w, out_h = int(round(width * scale)), int(round(height * scale))
+        return cv2.resize(image, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
     # -- wired execution --------------------------------------------------- #
     def run(
         self,
@@ -341,8 +404,10 @@ class PipelineBridge:
             if aligned is None:
                 result.notes.append(
                     "Module 2 could not resolve a four-corner board boundary — "
-                    "detection continued on the pre-processed image."
+                    "the frame was scaled to the detector's expected size "
+                    "instead of being aligned."
                 )
+                working = self._scale_to_align_target(working)
             else:
                 result.aligned = aligned
                 working = aligned

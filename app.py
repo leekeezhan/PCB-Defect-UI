@@ -62,7 +62,7 @@ if str(_APP_DIR) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from core import analysis, live, report, storage, video, viz
+from core import analysis, live, report, roi, storage, video, viz
 from core.analysis import BatchSummary, InspectionSummary
 from core.detector import DefectDetector, filter_by_class
 from core.pipeline_bridge import (
@@ -197,7 +197,7 @@ def _store_for(settings: Settings):
 # --------------------------------------------------------------------------- #
 # Shared inspection routine
 # --------------------------------------------------------------------------- #
-def inspect(image, bridge: Pipeline, detector, settings: Settings):
+def inspect(image, bridge: Pipeline, detector, settings: Settings, do_align: bool | None = None):
     """
     Run one board through the whole system.
 
@@ -206,6 +206,13 @@ def inspect(image, bridge: Pipeline, detector, settings: Settings):
         bridge: Module 1 / Module 2 adapter.
         detector: Module 3 adapter — local or remote; only ``predict`` is used.
         settings: the sidebar configuration.
+        do_align: override ``settings.do_align`` for this call only. ``None``
+            (the default) uses the sidebar setting, matching every existing
+            call site. Passed explicitly by the video page's single-frame
+            tool, which crops out one board at a time and always wants
+            alignment attempted on that crop — a lone, roughly-cropped board
+            resolves a four-corner boundary far more reliably than the full,
+            multi-board frame it came from.
 
     Returns:
         ``(stages, detection_result, summary, annotated)`` — every artefact the
@@ -215,7 +222,7 @@ def inspect(image, bridge: Pipeline, detector, settings: Settings):
         image,
         mode=settings.mode,
         do_preprocess=settings.do_preprocess,
-        do_align=settings.do_align,
+        do_align=settings.do_align if do_align is None else do_align,
     )
     detection_result = detector.predict(
         stages.final, confidence=settings.confidence, iou=settings.iou
@@ -431,7 +438,7 @@ def _render_single_result(stored: dict[str, Any], detector) -> None:
     download_row([
         ("📄 PDF inspection report", pdf_bytes, f"{stem}_report.pdf", "application/pdf"),
         ("🖼 Annotated image (PNG)", viz.encode_png(annotated), f"{stem}_annotated.png", "image/png"),
-        ("📊 Findings (CSV)", table.to_csv(index=False).encode("utf-8"),
+        ("📊 Findings (CSV)", table.to_csv(index=False).encode("utf-8-sig"),
          f"{stem}_findings.csv", "text/csv"),
     ])
 
@@ -642,10 +649,10 @@ def _render_batch_result(stored: dict[str, Any]) -> None:
 
     download_row([
         ("📄 PDF batch report", pdf_bytes, "batch_report.pdf", "application/pdf"),
-        ("📊 Results (CSV)", frame.to_csv(index=False).encode("utf-8"),
+        ("📊 Results (CSV)", frame.to_csv(index=False).encode("utf-8-sig"),
          "batch_results.csv", "text/csv"),
         ("📈 Distribution (CSV)",
-         distribution.to_csv(index=False).encode("utf-8") if not distribution.empty else None,
+         distribution.to_csv(index=False).encode("utf-8-sig") if not distribution.empty else None,
          "batch_distribution.csv", "text/csv"),
     ])
 
@@ -753,9 +760,391 @@ def page_video(bridge: Pipeline, detector, settings: Settings, store) -> None:
     stored = st.session_state.get("video_result")
     if not stored:
         st.info("Choose a video and select **Inspect video** to begin.", icon="🎞")
+    else:
+        _render_video_result(stored)
+
+    st.divider()
+    section("Board-by-board inspection")
+    st.caption(
+        "Inspect the clip one *board* at a time rather than one frame at a "
+        "time: each board is cut out of the stream and run through Modules "
+        "1-3 on its own, exactly as a still image would be, and every result "
+        "can be downloaded."
+    )
+    scan_tab, frame_tab = st.tabs(["Scan the whole video", "Pick one frame"])
+    with scan_tab:
+        _render_board_scan(video_bytes, video_name, bridge, detector, settings, store)
+    with frame_tab:
+        _render_frame_inspector(
+            video_bytes, info if video_bytes else None, bridge, detector, settings
+        )
+
+
+def _render_board_scan(
+    video_bytes: bytes | None,
+    video_name: str,
+    bridge: Pipeline,
+    detector,
+    settings: Settings,
+    store,
+) -> None:
+    """
+    Walk the whole clip, capture every board once, and inspect each on its own.
+
+    This is the board-oriented counterpart to the frame-by-frame run above.
+    A board stays in view for hundreds of frames, so inspecting frames returns
+    the same physical board over and over; tracking each board and capturing it
+    at its most complete moment gives one clean shot per board, and each of
+    those goes through Modules 1, 2 and 3 individually.
+    """
+    if not video_bytes:
+        st.info("Upload a video above to use this tool.", icon="🎞")
         return
 
-    _render_video_result(stored)
+    left, middle, right = st.columns([2, 2, 1])
+    with left:
+        every_n = st.slider(
+            "Check every n-th frame", 1, 15, 3, key="scan_every_n",
+            help="A board moves only a few pixels per frame, so testing every "
+                 "frame buys nothing. Lower this only if boards travel fast.",
+        )
+    with middle:
+        max_boards = st.slider(
+            "Maximum boards to capture", 1, 50, 20, key="scan_max_boards",
+            help="Stops a long clip from producing hundreds of inspections.",
+        )
+    with right:
+        st.write("")
+        st.write("")
+        run_scan = st.button("Scan video for boards", type="primary",
+                             use_container_width=True, key="scan_run")
+
+    include_partial = st.checkbox(
+        "Also inspect boards that are never completely in frame", value=False,
+        key="scan_include_partial",
+        help="A board still entering when the clip ends is cut off by the edge "
+             "of the picture. It is found and listed either way; inspecting one "
+             "reports only the defects on the visible part, so the verdict is "
+             "not a verdict on the whole board.",
+    )
+
+    if run_scan:
+        progress = st.progress(0.0, text="Scanning…")
+
+        def on_progress(fraction: float, message: str) -> None:
+            progress.progress(min(1.0, max(0.0, fraction)), text=message)
+
+        with st.spinner("Finding boards…"):
+            captured = video.scan_boards(
+                video_bytes,
+                every_n_frames=int(every_n),
+                max_boards=int(max_boards),
+                progress=on_progress,
+            )
+
+        results = []
+        skipped = 0
+        for position, board in enumerate(captured, start=1):
+            progress.progress(
+                min(1.0, position / max(1, len(captured))),
+                text=f"Inspecting board {position} of {len(captured)}…",
+            )
+            item = {
+                "index": position,
+                "frame": board["frame"],
+                "timestamp_s": board["timestamp_s"],
+                "box": board["box"],
+                "fully_visible": board["fully_visible"],
+                "stages": None, "detection": None, "summary": None, "annotated": None,
+            }
+            # A board the clip never shows whole is reported either way, but is
+            # only put through the pipeline when the operator asks for it — its
+            # verdict would otherwise read as a verdict on a board that was
+            # only half in the picture.
+            if board["fully_visible"] or include_partial:
+                stages, detection_result, summary, annotated = inspect(
+                    board["crop"], bridge, detector, settings, do_align=True
+                )
+                item.update({"stages": stages, "detection": detection_result,
+                             "summary": summary, "annotated": annotated})
+            else:
+                skipped += 1
+            results.append(item)
+        progress.empty()
+
+        inspected = [item for item in results if item["summary"] is not None]
+        logged = _log(
+            store,
+            [item["summary"] for item in inspected],
+            [f"{video_name}#board_{item['index']}_frame_{item['frame']}" for item in inspected],
+            "video-board",
+            detector.model_name,
+        )
+        st.session_state["board_scan_result"] = {
+            "name": video_name, "boards": results, "logged": logged, "skipped": skipped,
+        }
+
+    scan = st.session_state.get("board_scan_result")
+    if not scan:
+        st.info("Select **Scan video for boards** to inspect the clip board by board.",
+                icon="🔍")
+        return
+
+    boards = scan["boards"]
+    if not boards:
+        st.warning(
+            "No board was found in this clip. Lower **Check every n-th frame**, "
+            "or use the *Pick one frame* tab to look at a frame directly.",
+            icon="⚠️",
+        )
+        return
+
+    inspected = [item for item in boards if item["summary"] is not None]
+    failed = sum(1 for item in inspected if item["summary"].verdict == "FAIL")
+    columns = st.columns(4)
+    columns[0].metric("Boards found", len(boards))
+    columns[1].metric("Boards inspected", len(inspected))
+    columns[2].metric("Failing boards", failed)
+    columns[3].metric(
+        "Defects found", sum(item["summary"].total_defects for item in inspected)
+    )
+
+    if scan.get("skipped"):
+        st.info(
+            f"{scan['skipped']} board(s) are never completely inside the picture "
+            "in this clip — they are still listed below, but were not inspected, "
+            "because a verdict on a board that is half out of frame is not a "
+            "verdict on the board. Tick the box above to inspect them anyway.",
+            icon="ℹ️",
+        )
+    if scan.get("logged"):
+        st.caption(f"· {scan['logged']} inspection(s) written to history.")
+
+    table = pd.DataFrame([
+        {
+            "board": item["index"],
+            "frame": item["frame"],
+            "time_s": round(item["timestamp_s"], 2),
+            "in_frame": "whole board" if item["fully_visible"] else "partly cut off",
+            "verdict": item["summary"].verdict if item["summary"] else "not inspected",
+            "defects": item["summary"].total_defects if item["summary"] else None,
+            "quality_score": (round(item["summary"].quality_score, 1)
+                              if item["summary"] else None),
+            "alignment": (_alignment_state(item["stages"]) if item["stages"] else "—"),
+        }
+        for item in boards
+    ])
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    section("Export")
+    stem = Path(scan["name"]).stem or "stream"
+    pdf_bytes = None
+    if inspected:
+        batch = analysis.summarise_batch([item["summary"] for item in inspected])
+        rows = [
+            item["summary"].as_row(f"board{item['index']:02d}_frame{item['frame']}")
+            for item in inspected
+        ]
+        # Failing/review boards make the most useful evidence appendix — same
+        # choice as the other batch-style reports in this app.
+        gallery = [
+            (f"Board {item['index']} — frame {item['frame']} — {item['summary'].verdict}",
+             viz.thumbnail(item["annotated"], 520))
+            for item in inspected
+            if item["summary"].verdict in ("FAIL", "REVIEW")
+        ][:6]
+        pdf_bytes, pdf_error = _build_pdf(
+            report.build_batch_report,
+            batch=batch,
+            rows=rows,
+            config=settings.as_config(detector.status()),
+            run_name=f"Video board scan — {scan['name']}",
+            gallery=gallery,
+        )
+        if pdf_error:
+            st.warning(f"The PDF report could not be generated — {pdf_error}", icon="⚠️")
+    else:
+        st.caption("Inspect at least one board to generate a PDF report.")
+
+    download_row([
+        ("📄 PDF stream report", pdf_bytes, f"{stem}_boards_report.pdf", "application/pdf"),
+        ("🗂 All boards (ZIP)", _boards_zip(inspected, scan["name"]),
+         "video_boards.zip", "application/zip"),
+        ("📊 Summary (CSV)", table.to_csv(index=False).encode("utf-8-sig"),
+         "video_boards.csv", "text/csv"),
+    ])
+
+    for item in boards:
+        heading = (f"###### Board {item['index']} — frame {item['frame']} "
+                   f"(t = {item['timestamp_s']:.1f} s)")
+        if not item["fully_visible"]:
+            heading += " · partly cut off"
+        st.markdown(heading)
+        if item["summary"] is None:
+            st.caption("Not inspected — the clip never shows this board whole.")
+            continue
+        _render_board_pair(item, f"board{item['index']}_frame{item['frame']}")
+
+
+def _alignment_state(stages) -> str:
+    """One word for what Module 2 actually did to this board."""
+    if not stages.align_ok:
+        return "no outline"
+    return "straightened" if getattr(stages, "align_effective", True) else "rescaled only"
+
+
+def _render_board_pair(item: dict[str, Any], stem: str) -> None:
+    """Show one board's detector input and annotated result, with downloads."""
+    stages = item["stages"]
+    state = _alignment_state(stages)
+    captions = {
+        "straightened": "Module 1 + 2 output — board straightened (detector input)",
+        "rescaled only": ("Module 1 output — Module 2 rescaled it without "
+                          "straightening it (detector input)"),
+        "no outline": "Module 1 output — Module 2 found no board outline (detector input)",
+    }
+    columns = st.columns(2)
+    columns[0].image(viz.to_rgb(stages.final), caption=captions[state],
+                     use_container_width=True)
+    columns[1].image(
+        viz.to_rgb(item["annotated"]),
+        caption=f"{item['summary'].verdict} · {item['summary'].total_defects} defect(s)",
+        use_container_width=True,
+    )
+    download_row([
+        (f"⬇️ Detector input", viz.encode_jpeg(stages.final), f"{stem}_input.jpg", "image/jpeg"),
+        (f"⬇️ Annotated", viz.encode_jpeg(item["annotated"]),
+         f"{stem}_annotated.jpg", "image/jpeg"),
+    ])
+
+
+def _boards_zip(boards: list[dict[str, Any]], video_name: str) -> bytes | None:
+    """
+    Bundle every inspected board into one archive.
+
+    With a dozen boards on screen, downloading them one button at a time is
+    the slow path — this packs both images per board plus the summary table
+    into a single file.
+    """
+    if not boards:
+        return None
+
+    import csv
+    import io
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        rows = io.StringIO()
+        writer = csv.writer(rows)
+        writer.writerow(["board", "frame", "time_s", "verdict", "defects",
+                         "quality_score", "alignment", "source_video"])
+        for item in boards:
+            if item.get("summary") is None:      # found but not inspected
+                continue
+            stem = f"board{item['index']:02d}_frame{item['frame']}"
+            for suffix, image in (("input", item["stages"].final),
+                                  ("annotated", item["annotated"])):
+                encoded = viz.encode_jpeg(image)
+                if encoded:
+                    archive.writestr(f"{stem}_{suffix}.jpg", encoded)
+            writer.writerow([
+                item["index"], item["frame"], round(item["timestamp_s"], 2),
+                item["summary"].verdict, item["summary"].total_defects,
+                round(item["summary"].quality_score, 1),
+                _alignment_state(item["stages"]), video_name,
+            ])
+        # utf-8-sig so Excel (which assumes the system codepage without a
+        # byte-order mark) doesn't mangle non-ASCII characters like "—".
+        archive.writestr("summary.csv", rows.getvalue().encode("utf-8-sig"))
+    return buffer.getvalue()
+
+
+def _render_frame_inspector(
+    video_bytes: bytes | None,
+    info: dict[str, Any] | None,
+    bridge: Pipeline,
+    detector,
+    settings: Settings,
+) -> None:
+    """
+    Pull one operator-chosen frame out of the clip and run it through Modules
+    1-3 on its own. A frame can hold more than one board — each detected
+    region is cropped and inspected separately.
+    """
+    st.caption(
+        "Pick a frame number and run it through the full pipeline by itself — "
+        "useful for a close look at one moment in the clip. If the frame "
+        "contains more than one board, each one is detected, cropped and "
+        "inspected on its own."
+    )
+
+    if not video_bytes:
+        st.info("Upload a video above to use this tool.", icon="🎞")
+        return
+
+    frame_count = info["frame_count"] if info and info["frame_count"] else 1
+    pick_col, button_col = st.columns([3, 1])
+    with pick_col:
+        frame_index = st.number_input(
+            "Frame number", min_value=0, max_value=max(0, frame_count - 1),
+            value=0, step=1, key="frame_inspector_index",
+            help=f"This clip has {frame_count} frame(s).",
+        )
+    with button_col:
+        st.write("")
+        st.write("")
+        inspect_frame = st.button(
+            "Detect boards in this frame", use_container_width=True,
+            key="frame_inspector_run",
+        )
+
+    if inspect_frame:
+        frame = video.extract_frame(video_bytes, int(frame_index))
+        if frame is None:
+            st.error("Could not read that frame from the video.", icon="⛔")
+        else:
+            boxes = roi.find_pcb_regions(frame)
+            board_results = []
+            for box in boxes:
+                crop = roi.crop_with_padding(frame, box)
+                stages, detection_result, summary, annotated = inspect(
+                    crop, bridge, detector, settings, do_align=True
+                )
+                board_results.append({
+                    "box": box,
+                    "stages": stages,
+                    "detection": detection_result,
+                    "summary": summary,
+                    "annotated": annotated,
+                })
+            st.session_state["frame_boards_result"] = {
+                "frame_index": int(frame_index),
+                "overview": roi.draw_regions(frame, boxes),
+                "boards": board_results,
+            }
+
+    frame_boards = st.session_state.get("frame_boards_result")
+    if not frame_boards:
+        return
+
+    st.markdown(
+        f"**Boards detected: {len(frame_boards['boards'])}** "
+        f"— frame {frame_boards['frame_index']}"
+    )
+    st.image(
+        viz.to_rgb(frame_boards["overview"]),
+        caption=f"Detected ROIs ({len(frame_boards['boards'])} board(s))",
+        use_container_width=True,
+    )
+
+    if not frame_boards["boards"]:
+        st.info("No PCB-shaped region was found in this frame.", icon="ℹ️")
+        return
+
+    for i, board in enumerate(frame_boards["boards"], start=1):
+        st.markdown(f"###### Board {i}")
+        _render_board_pair(board, f"frame{frame_boards['frame_index']}_board{i}")
 
 
 def _render_video_result(stored: dict[str, Any]) -> None:
@@ -824,7 +1213,7 @@ def _render_video_result(stored: dict[str, Any]) -> None:
         download_row([
             ("📄 PDF stream report", pdf_bytes, f"{stem}_report.pdf", "application/pdf"),
             ("🎞 Annotated video", result.video_bytes, f"{stem}_inspected.mp4", "video/mp4"),
-            ("📊 Timeline (CSV)", frame.to_csv(index=False).encode("utf-8"),
+            ("📊 Timeline (CSV)", frame.to_csv(index=False).encode("utf-8-sig"),
              f"{stem}_timeline.csv", "text/csv"),
         ])
 
@@ -1120,7 +1509,7 @@ def _render_live_summary(stats: live.LiveStats, settings: Settings, detector) ->
          viz.encode_png(stats.worst_frame) if stats.worst_frame is not None else None,
          "live_worst_frame.png", "image/png"),
         ("📊 Timeline (CSV)",
-         frame.to_csv(index=False).encode("utf-8") if not frame.empty else None,
+         frame.to_csv(index=False).encode("utf-8-sig") if not frame.empty else None,
          "live_timeline.csv", "text/csv"),
     ])
 
@@ -1261,7 +1650,7 @@ def page_history(store, settings: Settings) -> None:
 
     download_row([
         ("📄 PDF history report", pdf_bytes, "inspection_history.pdf", "application/pdf"),
-        ("📊 History (CSV)", filtered.to_csv(index=False).encode("utf-8"),
+        ("📊 History (CSV)", filtered.to_csv(index=False).encode("utf-8-sig"),
          "inspection_history.csv", "text/csv"),
     ])
 

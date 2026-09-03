@@ -147,6 +147,26 @@ def _encode(image: np.ndarray | None) -> str | None:
     return base64.b64encode(buffer.tobytes()).decode("ascii") if ok else None
 
 
+def _scale_to_align_target(image: np.ndarray) -> np.ndarray:
+    """
+    Resize a whole frame to the same longest-side target a successful Module 2
+    alignment would produce (``image_pipeline.ALIGN_TARGET``).
+
+    Used when the board boundary could not be resolved to a clean quadrilateral:
+    without this, the un-aligned frame reaches the detector at its own native
+    resolution, which can be a very different scale from what the detector was
+    trained on (every training image — aligned or not — is scaled to this same
+    target). Mirrors the fallback branch of ``image_pipeline.detection_input()``,
+    the function Module 3 documents as the one true source of detector input for
+    both training and inference.
+    """
+    target = getattr(_CONTRACT, "ALIGN_TARGET", 1280)
+    height, width = image.shape[:2]
+    scale = target / max(width, height)
+    out_w, out_h = int(round(width * scale)), int(round(height * scale))
+    return cv2.resize(image, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+
 # --------------------------------------------------------------------------- #
 # GET /health — read by both clients; each reads the half it cares about.
 # --------------------------------------------------------------------------- #
@@ -202,7 +222,11 @@ async def process(
     if align.lower() == "true":
         aligned_image = _CONTRACT.align_image(working)
         if aligned_image is None:
-            notes.append("No four-corner board boundary was found.")
+            notes.append(
+                "No four-corner board boundary was found; the frame was scaled "
+                "to the detector's expected size instead of being aligned."
+            )
+            working = _scale_to_align_target(working)
         else:
             working = aligned_image
 
