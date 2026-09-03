@@ -176,7 +176,11 @@ def health() -> dict[str, Any]:
         "status": "ok",
         # -- read by core/pipeline_remote.py -------------------------------- #
         "service": "local-stand-in-modules-1-2-3",
-        "modules": {"preprocess": _CONTRACT is not None, "align": _CONTRACT is not None},
+        "modules": {
+            "preprocess": _CONTRACT is not None,
+            "align": _CONTRACT is not None,
+            "validate": bool(_CONTRACT is not None and hasattr(_CONTRACT, "student1_validate")),
+        },
         "modes": ["module"] if _CONTRACT is not None else [],
         "workspace": str(WORKSPACE) if WORKSPACE else None,
         "pipeline_error": _CONTRACT_ERROR,
@@ -212,6 +216,37 @@ async def process(
     pre_image: np.ndarray | None = None
     aligned_image: np.ndarray | None = None
 
+    # -- PCB validation ---------------------------------------------------- #
+    # Student 1's validate_pcb_image (exposed here as student1_validate) is run
+    # on the ORIGINAL upload, before Modules 1 and 2 do any work — exactly the
+    # contract documented on student1_validate itself: "reject non-PCB uploads
+    # before doing any work". Without this, an arbitrary photo sails through
+    # preprocessing + alignment + detection and reports PASS simply because the
+    # detector — trained only on PCB defect classes — finds nothing to flag.
+    pcb_valid: bool | None = None
+    pcb_message: str | None = None
+    if hasattr(_CONTRACT, "student1_validate"):
+        try:
+            pcb_valid, pcb_message = _CONTRACT.student1_validate(original)
+        except Exception as exc:                                    # noqa: BLE001
+            notes.append(f"PCB validation raised {type(exc).__name__}: {exc}")
+        else:
+            if pcb_valid is False:
+                notes.append(pcb_message or "Rejected: the uploaded image does not appear to contain a PCB.")
+                return {
+                    "final": _encode(original),
+                    "notes": notes,
+                    "elapsed_ms": (time.perf_counter() - started) * 1000,
+                    "mode": "module",
+                    "pcb_valid": False,
+                    "pcb_message": pcb_message,
+                }
+    else:
+        notes.append(
+            "image_pipeline.student1_validate is unavailable on this checkout — "
+            "uploads are not checked for containing a PCB before detection."
+        )
+
     if preprocess.lower() == "true":
         pre_image = _CONTRACT.preprocess_image(original)
         if pre_image is None:
@@ -237,6 +272,8 @@ async def process(
         "notes": notes,
         "elapsed_ms": (time.perf_counter() - started) * 1000,
         "mode": "module",
+        "pcb_valid": pcb_valid,
+        "pcb_message": pcb_message,
     }
 
 

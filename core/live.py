@@ -27,6 +27,7 @@ tested without a server.
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -34,7 +35,9 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from .analysis import InspectionCriteria, InspectionSummary, summarise
+from . import pcb_check
+from .analysis import InspectionCriteria, InspectionSummary, rejected, summarise
+from .detector import DetectionResult
 from .pipeline_bridge import PipelineBridge  # noqa: F401  (documents the contract)
 
 #: Either pipeline adapter — the HTTP client or the local bridge.
@@ -43,6 +46,14 @@ from .viz import draw_detections, draw_verdict_banner
 
 #: How many camera indices to probe when looking for attached devices.
 MAX_CAMERA_INDEX = 4
+
+#: How many times to ask a freshly opened device for a frame before giving up.
+#: The first read routinely fails while the camera is still starting its stream.
+_READ_ATTEMPTS = 3
+
+#: Which capture backend actually worked for each index, filled in by
+#: :func:`list_cameras` so :func:`open_camera` does not have to rediscover it.
+_BACKEND_FOR_INDEX: dict[int, int] = {}
 
 #: Rolling timeline length. Older entries are discarded so a long session does
 #: not grow without bound.
@@ -63,36 +74,131 @@ def _silence_opencv() -> None:
         pass
 
 
+def capture_backends() -> tuple[int, ...]:
+    """
+    Capture backends to try, best first, for the platform this is running on.
+
+    OpenCV's default choice is not always the working one. On Windows it
+    defaults to Media Foundation (MSMF), which routinely fails to open
+    integrated laptop webcams and several USB cameras that DirectShow opens
+    without trouble — the device then looks *absent* to this module even
+    though the browser can use the very same camera for Snapshot mode. Trying
+    DirectShow first there, and keeping the library default last everywhere,
+    means the camera is found whichever backend happens to work.
+    """
+    if sys.platform.startswith("win"):
+        return (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
+    if sys.platform == "darwin":
+        return (cv2.CAP_AVFOUNDATION, cv2.CAP_ANY)
+    return (cv2.CAP_V4L2, cv2.CAP_ANY)
+
+
+def backend_name(backend: int) -> str:
+    """Human-readable name for a capture backend constant."""
+    try:
+        return cv2.videoio_registry.getBackendName(backend)
+    except Exception:                                        # noqa: BLE001
+        return str(backend)
+
+
+def _read_a_frame(capture: cv2.VideoCapture) -> bool:
+    """
+    Whether ``capture`` delivers a real frame, allowing for a slow start.
+
+    A camera that has just been opened often fails its first read or two while
+    the driver starts the stream, so a single failed read is not evidence that
+    the device does not work.
+    """
+    for attempt in range(_READ_ATTEMPTS):
+        ok, frame = capture.read()
+        if ok and frame is not None:
+            return True
+        time.sleep(0.08)
+    return False
+
+
+def _try_open(index: int, backend: int) -> cv2.VideoCapture | None:
+    """Open one index with one backend, returning it only if it delivers a frame."""
+    capture = None
+    try:
+        capture = cv2.VideoCapture(int(index), int(backend))
+        if capture.isOpened() and _read_a_frame(capture):
+            return capture
+    except Exception:                                        # noqa: BLE001
+        pass
+    if capture is not None:
+        capture.release()
+    return None
+
+
+def probe_report(max_index: int = MAX_CAMERA_INDEX) -> list[dict[str, Any]]:
+    """
+    Probe every index with every backend and report what each attempt did.
+
+    "No camera was detected" has several very different causes — no device,
+    a device held by another program (the browser's own camera preview is the
+    usual culprit), or a backend that cannot drive this particular camera.
+    The interface shows this table so the operator can tell them apart instead
+    of guessing.
+
+    Returns:
+        One row per (index, backend) attempt, with ``opened`` and ``read``
+        recording how far it got.
+    """
+    _silence_opencv()
+    rows: list[dict[str, Any]] = []
+    for index in range(max(0, int(max_index))):
+        for backend in capture_backends():
+            capture = None
+            opened = read = False
+            try:
+                capture = cv2.VideoCapture(int(index), int(backend))
+                opened = bool(capture.isOpened())
+                if opened:
+                    read = _read_a_frame(capture)
+            except Exception:                                # noqa: BLE001
+                pass
+            finally:
+                if capture is not None:
+                    capture.release()
+            rows.append({
+                "camera": index,
+                "backend": backend_name(backend),
+                "opened": opened,
+                "delivered a frame": read,
+            })
+            if read:                     # this index works; no need for the rest
+                break
+    return rows
+
+
 def list_cameras(max_index: int = MAX_CAMERA_INDEX) -> list[int]:
     """
     Find camera indices that can actually deliver a frame.
 
     ``isOpened()`` alone is not sufficient — on several platforms a virtual or
     busy device opens and then fails to read — so each candidate must produce
-    one real frame before it is reported.
+    one real frame before it is reported. Each index is tried against every
+    backend in :func:`capture_backends`, and the one that worked is remembered
+    for :func:`open_camera`.
 
     Args:
         max_index: probe indices ``0`` to ``max_index - 1``.
 
     Returns:
-        The working indices. An empty list simply means no camera is attached,
+        The working indices. An empty list simply means no camera is available,
         which is a normal state, not an error.
     """
     _silence_opencv()
     working: list[int] = []
     for index in range(max(0, int(max_index))):
-        capture = None
-        try:
-            capture = cv2.VideoCapture(index)
-            if capture.isOpened():
-                ok, frame = capture.read()
-                if ok and frame is not None:
-                    working.append(index)
-        except Exception:                                    # noqa: BLE001
-            pass
-        finally:
+        for backend in capture_backends():
+            capture = _try_open(index, backend)
             if capture is not None:
                 capture.release()
+                _BACKEND_FOR_INDEX[index] = backend
+                working.append(index)
+                break
     return working
 
 
@@ -104,6 +210,10 @@ def open_camera(
     """
     Open a camera and request a capture resolution.
 
+    The backend that :func:`list_cameras` found working for this index is tried
+    first; the remaining ones follow, so opening still succeeds if the probe
+    never ran (the camera was plugged in afterwards, say).
+
     Args:
         index: device index, as returned by :func:`list_cameras`.
         width: requested frame width. The driver may ignore it.
@@ -113,11 +223,18 @@ def open_camera(
         An open ``VideoCapture``, or ``None`` when the device is unavailable.
     """
     _silence_opencv()
-    try:
-        capture = cv2.VideoCapture(int(index))
-        if not capture.isOpened():
-            capture.release()
-            return None
+    index = int(index)
+
+    remembered = _BACKEND_FOR_INDEX.get(index)
+    order = list(capture_backends())
+    if remembered is not None:
+        order = [remembered] + [b for b in order if b != remembered]
+
+    for backend in order:
+        capture = _try_open(index, backend)
+        if capture is None:
+            continue
+        _BACKEND_FOR_INDEX[index] = backend
         if width:
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
         if height:
@@ -129,8 +246,7 @@ def open_camera(
         except Exception:                                    # noqa: BLE001
             pass
         return capture
-    except Exception:                                        # noqa: BLE001
-        return None
+    return None
 
 
 def close_camera(capture: cv2.VideoCapture | None) -> None:
@@ -296,8 +412,28 @@ def run_chunk(
             break
 
         stages = bridge.run(frame, mode=mode, do_preprocess=do_preprocess, do_align=do_align)
-        detection_result = detector.predict(stages.final, confidence=confidence, iou=iou)
-        summary = summarise(detection_result, criteria)
+        # Student 1's own check (StageResult.pcb_valid) plus this repository's
+        # independent second opinion (hue concentration + texture) — either
+        # one rejecting is enough.
+        pcb_valid, pcb_message = pcb_check.evaluate(
+            stages.pcb_valid, stages.pcb_message, stages.original
+        )
+        if pcb_valid is False:
+            # Rejected before Modules 1-3 did any work on this frame (camera
+            # pointed at the bench, a hand, nothing at all, ...) — see
+            # core.analysis.rejected.
+            image_shape = stages.final.shape[:2] if stages.final is not None else (0, 0)
+            detection_result = DetectionResult(
+                detections=[], inference_ms=0.0, image_shape=image_shape,
+                model_name=detector.model_name, error=None,
+            )
+            summary = rejected(
+                pcb_message or "Frame does not appear to contain a PCB.",
+                image_shape=image_shape,
+            )
+        else:
+            detection_result = detector.predict(stages.final, confidence=confidence, iou=iou)
+            summary = summarise(detection_result, criteria)
 
         annotated = draw_detections(
             stages.final,

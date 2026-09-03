@@ -196,6 +196,43 @@ def summarise(
     )
 
 
+def rejected(reason: str, image_shape: tuple[int, int] = (0, 0)) -> InspectionSummary:
+    """
+    Build the summary for an upload that never reached the detector because
+    Student 1's ``validate_pcb_image`` (wired in via
+    ``core.pipeline_bridge``/``core.pipeline_remote``) determined it does not
+    contain a PCB.
+
+    Reported as an outright :data:`VERDICT_FAIL` rather than a fourth verdict,
+    so every existing verdict count, filter, chart and CSV/PDF export — which
+    only know PASS / REVIEW / FAIL — handles a rejected upload correctly
+    without any changes of their own.
+
+    Args:
+        reason: the validator's own message (e.g. "Uploaded image does not
+            appear to contain a PCB."), shown to the operator as-is.
+        image_shape: the rejected image's ``(height, width)``, for the record.
+
+    Returns:
+        An :class:`InspectionSummary` with zeroed detection statistics.
+    """
+    return InspectionSummary(
+        verdict=VERDICT_FAIL,
+        quality_score=0.0,
+        total_defects=0,
+        confident_defects=0,
+        uncertain_defects=0,
+        critical_defects=0,
+        class_counts={},
+        mean_confidence=0.0,
+        min_confidence=0.0,
+        max_confidence=0.0,
+        reasons=[f"Rejected before detection: {reason}"],
+        inference_ms=0.0,
+        image_shape=image_shape,
+    )
+
+
 def quality_score(
     detections: Sequence[Detection],
     criteria: InspectionCriteria | None = None,

@@ -155,6 +155,14 @@ class StageResult:
         elapsed_ms: how long Modules 1 and 2 took. Set by the remote adapter —
             the service's own timing when it reports one, the round trip
             otherwise — and left at zero by the local adapter.
+        pcb_valid: result of Student 1's ``validate_pcb_image`` run on the
+            *original* upload, before any other stage. ``True``/``False`` when
+            a validator answered, ``None`` when none was available (an older
+            checkout of the shared repository, or a remote service that has
+            not been updated yet) — callers must treat ``None`` as "unknown",
+            never as "invalid".
+        pcb_message: the validator's own human-readable message, whichever way
+            ``pcb_valid`` came out. ``None`` alongside ``pcb_valid is None``.
     """
 
     original: np.ndarray
@@ -164,6 +172,8 @@ class StageResult:
     notes: list[str] = field(default_factory=list)
     mode: str = MODE_MODULE
     elapsed_ms: float = 0.0
+    pcb_valid: bool | None = None
+    pcb_message: str | None = None
 
     @property
     def preprocess_ok(self) -> bool:
@@ -320,6 +330,31 @@ class PipelineBridge:
         except Exception:                  # noqa: BLE001
             return None
 
+    def validate(self, image: np.ndarray) -> tuple[bool | None, str | None]:
+        """
+        Run Student 1's ``validate_pcb_image`` (exposed as
+        ``image_pipeline.student1_validate``) on ``image``, so the pipeline can
+        reject an upload that is not a PCB before Modules 1-3 do any work on it.
+
+        ``student1_validate`` loads the notebook's helpers itself, so this
+        works whichever execution mode (``module``/``notebook``) is selected —
+        validation is not an execution mode, it always runs first.
+
+        Returns:
+            ``(None, None)`` when the loaded contract has no validator (an
+            older checkout of the shared repository) — callers must treat this
+            as "unknown", not as "invalid", and let the rest of the pipeline
+            run unguarded, same as before this check existed. Otherwise
+            ``(is_pcb, message)`` exactly as Student 1's function reports it.
+        """
+        if not self._has("student1_validate"):
+            return None, None
+        try:
+            valid, message = self._module.student1_validate(image)
+            return bool(valid), str(message)
+        except Exception as exc:           # noqa: BLE001
+            return None, f"PCB validation raised {type(exc).__name__}: {exc}"
+
     def _scale_to_align_target(self, image: np.ndarray) -> np.ndarray:
         """
         Resize a whole frame to the same longest-side target a successful
@@ -370,6 +405,16 @@ class PipelineBridge:
             result.notes.append(
                 "Modules 1 and 2 are unavailable — detection ran on the raw image."
             )
+            result.final = image
+            return result
+
+        valid, message = self.validate(image)
+        result.pcb_valid = valid
+        result.pcb_message = message
+        if valid is False:
+            # Reject before doing any work, per student1_validate's own
+            # contract — Modules 1-3 never see an upload that isn't a PCB.
+            result.notes.append(message or "Rejected: the uploaded image does not appear to contain a PCB.")
             result.final = image
             return result
 

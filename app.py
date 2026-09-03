@@ -62,9 +62,9 @@ if str(_APP_DIR) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from core import analysis, live, report, roi, storage, video, viz
+from core import analysis, live, pcb_check, report, roi, storage, video, viz
 from core.analysis import BatchSummary, InspectionSummary
-from core.detector import DefectDetector, filter_by_class
+from core.detector import DefectDetector, DetectionResult, filter_by_class
 from core.pipeline_bridge import (
     create_pipeline,
     decode_image,
@@ -224,6 +224,32 @@ def inspect(image, bridge: Pipeline, detector, settings: Settings, do_align: boo
         do_preprocess=settings.do_preprocess,
         do_align=settings.do_align if do_align is None else do_align,
     )
+
+    # Student 1's validate_pcb_image() alone (StageResult.pcb_valid) only
+    # checks for a plausibly-sized, plausibly-shaped saturated blob — this
+    # repository's own pcb_check.evaluate() adds a second, independent
+    # opinion (dominant-hue concentration + edge/texture density) on top of
+    # it, run on the ORIGINAL upload. Either one rejecting is enough.
+    pcb_valid, pcb_message = pcb_check.evaluate(
+        stages.pcb_valid, stages.pcb_message, stages.original
+    )
+    if pcb_valid is False:
+        # Rejected before Modules 1-3 ran any work on it. Reported as an
+        # outright FAIL via analysis.rejected() rather than being sent to the
+        # detector, so an arbitrary non-PCB photo can no longer report PASS
+        # simply because the detector found nothing it recognises.
+        image_shape = stages.final.shape[:2] if stages.final is not None else (0, 0)
+        detection_result = DetectionResult(
+            detections=[], inference_ms=0.0, image_shape=image_shape,
+            model_name=detector.model_name, error=None,
+        )
+        summary = analysis.rejected(
+            pcb_message or "Uploaded image does not appear to contain a PCB.",
+            image_shape=image_shape,
+        )
+        annotated = stages.final
+        return stages, detection_result, summary, annotated
+
     detection_result = detector.predict(
         stages.final, confidence=settings.confidence, iou=settings.iou
     )
@@ -1297,12 +1323,32 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
     cameras = _camera_list()
     if not cameras and not running:
         st.warning(
-            "No camera was detected on the machine running this interface. "
-            "Continuous mode captures locally, so it needs a camera attached "
-            "here — use **Snapshot** mode if the camera is on the machine "
-            "viewing this page instead.",
+            "No camera could be opened from the machine running this interface. "
+            "Continuous mode captures here in Python, not in the browser, so it "
+            "needs the camera to be free and reachable from this process. The "
+            "usual cause is that something else already holds it — **Snapshot "
+            "mode in this or another tab keeps the camera open**, so close those "
+            "tabs (and any other app using it) and re-scan. Use **Snapshot** "
+            "mode instead if the camera is on the machine viewing this page "
+            "rather than the one running it.",
             icon="📷",
         )
+        rescan_col, _ = st.columns([1, 3])
+        with rescan_col:
+            if st.button("↻ Re-scan for cameras", use_container_width=True,
+                         key="live_rescan"):
+                _camera_list.clear()
+                st.rerun()
+        with st.expander("What the camera probe actually found"):
+            st.caption(
+                "Every device index is tried against every capture backend. "
+                "*opened* but not *delivered a frame* normally means the camera "
+                "is busy in another program; nothing opening at all means no "
+                "device at that index, or the operating system is denying this "
+                "Python process access to it."
+            )
+            st.dataframe(pd.DataFrame(live.probe_report()),
+                         use_container_width=True, hide_index=True)
 
     controls = st.columns([2, 2, 2, 1, 1])
     with controls[0]:
@@ -1351,7 +1397,12 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
         capture = st.session_state.get("live_capture")
         if capture is None:
             st.session_state["live_running"] = False
-            st.error("The camera could not be opened.", icon="⛔")
+            st.error(
+                "The camera could not be opened. It is most likely held by "
+                "another program — Snapshot mode in this or another browser tab "
+                "keeps it open. Close those and press Start again.",
+                icon="⛔",
+            )
             return
 
         st.markdown(

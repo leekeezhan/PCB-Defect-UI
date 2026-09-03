@@ -31,8 +31,9 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from .analysis import InspectionCriteria, InspectionSummary, summarise
-from .detector import DefectDetector
+from . import pcb_check
+from .analysis import InspectionCriteria, InspectionSummary, rejected, summarise
+from .detector import DefectDetector, DetectionResult
 from .pipeline_bridge import PipelineBridge  # noqa: F401  (documents the contract)
 from .roi import crop_with_padding, find_pcb_regions
 
@@ -424,10 +425,29 @@ def process_video(
             if frames_read % stride == 1 or stride == 1:
                 stages = bridge.run(frame, mode=mode,
                                     do_preprocess=do_preprocess, do_align=do_align)
-                detection_result = detector.predict(
-                    stages.final, confidence=confidence, iou=iou
+                # Student 1's own check (StageResult.pcb_valid) plus this
+                # repository's independent second opinion (hue concentration +
+                # texture) — either one rejecting is enough.
+                pcb_valid, pcb_message = pcb_check.evaluate(
+                    stages.pcb_valid, stages.pcb_message, stages.original
                 )
-                summary = summarise(detection_result, criteria)
+                if pcb_valid is False:
+                    # Rejected before Modules 1-3 did any work on this frame —
+                    # see core.analysis.rejected.
+                    image_shape = stages.final.shape[:2] if stages.final is not None else (0, 0)
+                    detection_result = DetectionResult(
+                        detections=[], inference_ms=0.0, image_shape=image_shape,
+                        model_name=detector.model_name, error=None,
+                    )
+                    summary = rejected(
+                        pcb_message or "Frame does not appear to contain a PCB.",
+                        image_shape=image_shape,
+                    )
+                else:
+                    detection_result = detector.predict(
+                        stages.final, confidence=confidence, iou=iou
+                    )
+                    summary = summarise(detection_result, criteria)
                 summaries.append(summary)
 
                 timestamp = (frames_read - 1) / fps if fps else 0.0

@@ -414,6 +414,16 @@ class RemotePipeline:
             if text:
                 result.notes.append(text)
 
+        # ``pcb_valid`` is only ever a real bool when the service ran Student 1's
+        # validator — see ``local_service/serve.py``. Anything else (missing
+        # field, or an older service that predates this check) leaves it
+        # ``None``, meaning "unknown", never "invalid".
+        pcb_valid = payload.get("pcb_valid")
+        if isinstance(pcb_valid, bool):
+            result.pcb_valid = pcb_valid
+            message = payload.get("pcb_message")
+            result.pcb_message = str(message) if message else None
+
         elapsed = payload.get("elapsed_ms")
         result.elapsed_ms = float(elapsed) if isinstance(elapsed, (int, float)) else round_trip_ms
 
