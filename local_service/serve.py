@@ -140,6 +140,23 @@ def _decode_upload(data: bytes) -> np.ndarray | None:
     return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
 
+def _rectify_multi_board(frame: np.ndarray) -> tuple[np.ndarray | None, list[str]]:
+    """
+    Rectify EVERY board of a multi-board frame IN PLACE (see
+    ``image_pipeline.rectify_frame``): each board is warped onto the
+    axis-aligned rectangle that bounds it, so the result is the ORIGINAL
+    picture with every board at its correct angle. The detector is then run on
+    this rectified frame.
+
+    Returns ``(None, notes)`` for frames with zero or one board.
+    """
+    try:
+        rectified, num_boards, notes = _CONTRACT.rectify_frame(frame)
+        return (rectified, notes) if num_boards > 1 else (None, notes)
+    except Exception as exc:                                    # noqa: BLE001
+        return None, [f"Rectification failed: {type(exc).__name__}: {exc}"]
+
+
 def _encode(image: np.ndarray | None) -> str | None:
     if image is None:
         return None
@@ -216,6 +233,16 @@ async def process(
     pre_image: np.ndarray | None = None
     aligned_image: np.ndarray | None = None
 
+    do_preprocess = preprocess.lower() == "true"
+    do_align = align.lower() == "true"
+
+    # Board rectangles, returned so the interface can anchor detection marks
+    # to the boards even while they move along the conveyor.
+    try:
+        boxes = [[int(v) for v in b] for b in (_CONTRACT.find_boards(original) or [])]
+    except Exception:                                        # noqa: BLE001
+        boxes = []
+
     # -- PCB validation ---------------------------------------------------- #
     # Student 1's validate_pcb_image (exposed here as student1_validate) is run
     # on the ORIGINAL upload, before Modules 1 and 2 do any work — exactly the
@@ -223,52 +250,68 @@ async def process(
     # before doing any work". Without this, an arbitrary photo sails through
     # preprocessing + alignment + detection and reports PASS simply because the
     # detector — trained only on PCB defect classes — finds nothing to flag.
+    # Skipped when find_boards() already resolved 2+ real boards in the frame
+    # (conveyor footage): that is a stronger signal than the single-board
+    # check is designed to answer, and rejecting a busy, genuinely multi-board
+    # frame on it would be wrong.
     pcb_valid: bool | None = None
     pcb_message: str | None = None
-    if hasattr(_CONTRACT, "student1_validate"):
-        try:
-            pcb_valid, pcb_message = _CONTRACT.student1_validate(original)
-        except Exception as exc:                                    # noqa: BLE001
-            notes.append(f"PCB validation raised {type(exc).__name__}: {exc}")
+    if len(boxes) <= 1:
+        if not hasattr(_CONTRACT, "student1_validate"):
+            notes.append(
+                "image_pipeline.student1_validate is unavailable on this checkout — "
+                "uploads are not checked for containing a PCB before detection."
+            )
         else:
-            if pcb_valid is False:
-                notes.append(pcb_message or "Rejected: the uploaded image does not appear to contain a PCB.")
-                return {
-                    "final": _encode(original),
-                    "notes": notes,
-                    "elapsed_ms": (time.perf_counter() - started) * 1000,
-                    "mode": "module",
-                    "pcb_valid": False,
-                    "pcb_message": pcb_message,
-                }
-    else:
-        notes.append(
-            "image_pipeline.student1_validate is unavailable on this checkout — "
-            "uploads are not checked for containing a PCB before detection."
-        )
+            try:
+                pcb_valid, pcb_message = _CONTRACT.student1_validate(original)
+            except Exception as exc:                                # noqa: BLE001
+                notes.append(f"PCB validation raised {type(exc).__name__}: {exc}")
+            else:
+                if pcb_valid is False:
+                    notes.append(pcb_message or "Rejected: the uploaded image does not appear to contain a PCB.")
+                    return {
+                        "final": _encode(original),
+                        "boards": boxes,
+                        "notes": notes,
+                        "elapsed_ms": (time.perf_counter() - started) * 1000,
+                        "mode": "module",
+                        "pcb_valid": False,
+                        "pcb_message": pcb_message,
+                    }
 
-    if preprocess.lower() == "true":
+    if do_preprocess:
         pre_image = _CONTRACT.preprocess_image(original)
         if pre_image is None:
             notes.append("Module 1 returned nothing; the original image was kept.")
         else:
             working = pre_image
 
-    if align.lower() == "true":
-        aligned_image = _CONTRACT.align_image(working)
-        if aligned_image is None:
-            notes.append(
-                "No four-corner board boundary was found; the frame was scaled "
-                "to the detector's expected size instead of being aligned."
-            )
-            working = _scale_to_align_target(working)
+    if do_align:
+        # Several boards per frame: rectify every board IN PLACE (the frame
+        # keeps its layout with each board upright). This is a no-op for a
+        # single-board frame, which falls through to the usual alignment.
+        rectified, rect_notes = _rectify_multi_board(working)
+        notes.extend(rect_notes)
+        if rectified is not None:
+            aligned_image = rectified
+            working = rectified
         else:
-            working = aligned_image
+            aligned_image = _CONTRACT.align_image(working)
+            if aligned_image is None:
+                notes.append(
+                    "No four-corner board boundary was found; the frame was scaled "
+                    "to the detector's expected size instead of being aligned."
+                )
+                working = _scale_to_align_target(working)
+            else:
+                working = aligned_image
 
     return {
         "preprocessed": _encode(pre_image),
         "aligned": _encode(aligned_image),
         "final": _encode(working),
+        "boards": boxes,
         "notes": notes,
         "elapsed_ms": (time.perf_counter() - started) * 1000,
         "mode": "module",

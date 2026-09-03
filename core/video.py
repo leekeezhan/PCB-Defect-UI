@@ -31,15 +31,14 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from . import pcb_check
 from .analysis import InspectionCriteria, InspectionSummary, rejected, summarise
-from .detector import DefectDetector, DetectionResult
-from .pipeline_bridge import PipelineBridge  # noqa: F401  (documents the contract)
+from .detector import DefectDetector, Detection, DetectionResult
+from .pipeline_bridge import PipelineBridge, StageResult  # noqa: F401  (documents the contract)
 from .roi import crop_with_padding, find_pcb_regions
 
 #: Either pipeline adapter — the HTTP client or the local bridge.
 Pipeline = Any
-from .viz import draw_detections, draw_verdict_banner
+from .viz import draw_board_labels, draw_detections, draw_verdict_banner
 
 # Codecs to try, in order, when opening the output video writer. ``avc1``
 # (H.264) is what Chrome/Edge/Firefox can all play inline in a <video> tag,
@@ -55,6 +54,27 @@ _FOURCC_CANDIDATES = ("avc1", "H264", "mp4v")
 
 
 @dataclass
+class BoardRecord:
+    """Outcome of ONE board within one analysed frame."""
+
+    label: str
+    verdict: str
+    defect_count: int
+    quality_score: float
+    confidence: float = 0.0    # best detection confidence on this board, 0 = none
+    class_counts: dict[str, int] = field(default_factory=dict)
+
+    def as_row(self) -> dict[str, Any]:
+        return {
+            "board": self.label,
+            "verdict": self.verdict,
+            "defects": self.defect_count,
+            "quality_score": round(self.quality_score, 1),
+            "confidence": round(self.confidence, 2),
+        }
+
+
+@dataclass
 class FrameRecord:
     """Per-frame outcome, used for the timeline table and the defect chart."""
 
@@ -64,6 +84,7 @@ class FrameRecord:
     defect_count: int
     quality_score: float
     class_counts: dict[str, int] = field(default_factory=dict)
+    boards: list[BoardRecord] = field(default_factory=list)
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -101,6 +122,220 @@ class VideoResult:
     @property
     def failed_frames(self) -> int:
         return sum(1 for record in self.records if record.verdict == "FAIL")
+
+
+# --------------------------------------------------------------------------- #
+# Board-anchored temporal consensus
+# --------------------------------------------------------------------------- #
+@dataclass
+class _NormTrack:
+    """One defect candidate, stored in board-normalised coordinates."""
+    board_id: int
+    class_id: int
+    class_name: str
+    nx1: float
+    ny1: float
+    nx2: float
+    ny2: float
+    confidences: list[float]
+    last_seen: int        # index of the last analysed frame in which it matched
+    used: bool = False    # consumed by the current frame's matching pass
+
+    @property
+    def seen(self) -> int:
+        return len(self.confidences)
+
+
+def _boxes_iou(a: tuple[float, float, float, float],
+               b: tuple[float, float, float, float]) -> float:
+    """IoU of two ``(x, y, w, h)`` rectangles."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+class BoardAnchoredConsensus:
+    """
+    Anchor detection marks to the boards they belong to and stabilise them
+    across time.
+
+    The same physical board is analysed many times as it travels a conveyor,
+    and independent per-frame predictions flicker (motion blur, alignment
+    jitter, boxes hovering at the confidence threshold). Two consequences are
+    solved here:
+
+    1. **Stability** — a defect is only reported once it has been observed in
+       at least ``confirm`` analyses of the same board; one-off findings never
+       survive.
+    2. **Fixed coordinates** — board rectangles move from frame to frame, so a
+       defect is stored NORMALISED to its board (0..1 within the rectangle) and
+       re-projected onto the board's CURRENT rectangle when rendered. The mark
+       therefore stays exactly on the board even while it moves, and even on a
+       frame where the detector missed the defect.
+
+    ``confirm == 1`` disables smoothing and reports every detection as seen.
+    """
+
+    def __init__(self, confirm: int = 2, window: int = 3,
+                 iou_threshold: float = 0.3) -> None:
+        self.confirm = max(1, int(confirm))
+        self.window = max(1, int(window))
+        self.iou_threshold = float(iou_threshold)
+        self._tracks: list[_NormTrack] = []
+        self._next_board_id = 0
+        self._boards: dict[int, tuple[float, float, float, float]] = {}
+
+    @staticmethod
+    def _norm_iou(a: tuple[float, float, float, float],
+                  b: tuple[float, float, float, float]) -> float:
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        union = ((a[2] - a[0]) * (a[3] - a[1])
+                 + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+        return inter / union if union > 0 else 0.0
+
+    def _match_boards(self, boxes: list[tuple[int, int, int, int]]):
+        """
+        Match the frame's board rectangles to known board identities by IoU,
+        updating each identity with its latest rectangle. New rectangles get a
+        fresh id. Returns ``[(box, board_id), ...]`` in the order given.
+        """
+        matched: list[tuple[tuple[int, int, int, int], int]] = []
+        used: set[int] = set()
+        for box in boxes:
+            box_f = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+            best_id: int | None = None
+            best_iou = self.iou_threshold
+            for board_id, known in self._boards.items():
+                if board_id in used:
+                    continue
+                iou = _boxes_iou(box_f, known)
+                if iou >= best_iou:
+                    best_id, best_iou = board_id, iou
+            if best_id is None:
+                best_id = self._next_board_id
+                self._next_board_id += 1
+            self._boards[best_id] = box_f
+            used.add(best_id)
+            matched.append((box, best_id))
+        return matched
+
+    def _nearest_board(self, det: Detection,
+                       boxes: list[tuple[int, int, int, int]]) -> int | None:
+        """Index of the board containing the detection, else the nearest one."""
+        cx, cy = det.centre
+        best: int | None = None
+        best_dist = float("inf")
+        for i, (x, y, w, h) in enumerate(boxes):
+            if x <= cx <= x + w and y <= cy <= y + h:
+                return i
+            dx = min(abs(cx - x), abs(cx - (x + w)))
+            dy = min(abs(cy - y), abs(cy - (y + h)))
+            dist = dx + dy
+            if dist < best_dist:
+                best, best_dist = i, dist
+        return best
+
+    def update(self, boxes: list[tuple[int, int, int, int]],
+               detections: list[Detection], frame_index: int) -> None:
+        """
+        Feed one analysed frame's board rectangles and raw detections. Defects
+        are stored normalised to their board and matched across analyses by
+        class + IoU (in normalised space, so board size differences do not
+        matter).
+        """
+        matched = self._match_boards(boxes)
+        box_list = [box for box, _ in matched]
+
+        # Drop candidates that have not been seen for a whole window.
+        self._tracks = [
+            t for t in self._tracks if frame_index - t.last_seen < self.window
+        ]
+        for track in self._tracks:
+            track.used = False
+
+        for det in sorted(detections, key=lambda d: d.confidence, reverse=True):
+            index = self._nearest_board(det, box_list)
+            if index is None:
+                continue
+            (x, y, w, h), board_id = matched[index]
+            if w <= 0 or h <= 0:
+                continue
+            norm = (
+                (det.x1 - x) / w, (det.y1 - y) / h,
+                (det.x2 - x) / w, (det.y2 - y) / h,
+            )
+            best: _NormTrack | None = None
+            best_iou = self.iou_threshold
+            for track in self._tracks:
+                if track.used or track.board_id != board_id:
+                    continue
+                if track.class_name != det.class_name:
+                    continue
+                iou = self._norm_iou(
+                    (track.nx1, track.ny1, track.nx2, track.ny2), norm
+                )
+                if iou >= best_iou:
+                    best, best_iou = track, iou
+            if best is not None:
+                best.nx1, best.ny1, best.nx2, best.ny2 = norm
+                best.confidences.append(det.confidence)
+                best.last_seen = frame_index
+                best.used = True
+            else:
+                self._tracks.append(_NormTrack(
+                    board_id, det.class_id, det.class_name,
+                    norm[0], norm[1], norm[2], norm[3],
+                    [det.confidence], frame_index,
+                ))
+
+    def render_by_board(
+        self, boxes: list[tuple[int, int, int, int]], frame_index: int
+    ) -> list[tuple[int, list[Detection]]]:
+        """
+        Reproduce the STABLE marks per board, onto the frame's CURRENT board
+        rectangles.
+
+        Confirmed defects are re-projected from normalised coordinates onto the
+        board's current position, so each mark stays exactly on the board even
+        though it has moved since the defect was last detected. Returns
+        ``[(board_id, detections), ...]`` in the order of ``boxes``, so callers
+        can label each board and summarise per board.
+        """
+        matched = self._match_boards(boxes)
+        out: list[tuple[int, list[Detection]]] = []
+        for (x, y, w, h), board_id in matched:
+            dets: list[Detection] = []
+            for track in self._tracks:
+                if track.board_id != board_id or track.seen < self.confirm:
+                    continue
+                if frame_index - track.last_seen >= self.window:
+                    continue
+                dets.append(Detection(
+                    track.class_id, track.class_name,
+                    float(sum(track.confidences) / len(track.confidences)),
+                    x + track.nx1 * w, y + track.ny1 * h,
+                    x + track.nx2 * w, y + track.ny2 * h,
+                ))
+            out.append((board_id, dets))
+        return out
+
+    def render(self, boxes: list[tuple[int, int, int, int]],
+               frame_index: int) -> list[Detection]:
+        """Flat version of :meth:`render_by_board` for compatibility."""
+        flat: list[Detection] = []
+        for _board_id, dets in self.render_by_board(boxes, frame_index):
+            flat.extend(dets)
+        return flat
+
+    def reset(self) -> None:
+        self._tracks.clear()
+        self._boards.clear()
 
 
 def probe(video_bytes: bytes) -> dict[str, Any]:
@@ -342,6 +577,63 @@ def extract_frame(video_bytes: bytes, frame_index: int) -> np.ndarray | None:
         _remove(path)
 
 
+def stage_frame(
+    bridge: Any,
+    frame: np.ndarray,
+    *,
+    mode: str,
+    do_preprocess: bool,
+    do_align: bool,
+) -> StageResult:
+    """
+    Run Modules 1 and 2 over one frame.
+
+    With alignment enabled and more than one board detected (conveyor footage),
+    Module 1 pre-processes the frame and Module 2 then rectifies every board IN
+    PLACE — each board is warped onto its own axis-aligned rectangle, so the
+    operator still sees the conveyor picture but every board is at its correct
+    angle. Single-board frames and adapters without board rectification fall
+    back to ``bridge.run`` unchanged.
+    """
+    if (do_align and hasattr(bridge, "find_boards")
+            and hasattr(bridge, "preprocess") and hasattr(bridge, "rectify_frame")):
+        try:
+            boxes = list(bridge.find_boards(frame))
+        except Exception:                              # noqa: BLE001
+            boxes = []
+        if len(boxes) > 1:
+            working = frame
+            preprocessed: np.ndarray | None = None
+            notes: list[str] = []
+            if do_preprocess:
+                preprocessed = bridge.preprocess(frame)
+                if preprocessed is None:
+                    notes.append(
+                        "Module 1 returned no output — the original frame was kept."
+                    )
+                else:
+                    working = preprocessed
+            rectified = bridge.rectify_frame(working)
+            if rectified is not None:
+                notes.append(
+                    "Each board was straightened in place before detection."
+                )
+                return StageResult(original=frame, preprocessed=preprocessed,
+                                   aligned=rectified, final=rectified,
+                                   notes=notes, mode=mode,
+                                   board_boxes=boxes)
+    result = bridge.run(frame, mode=mode,
+                        do_preprocess=do_preprocess, do_align=do_align)
+    # Board rectangles power the detection anchoring (marks follow the moving
+    # boards). The remote adapter gets them from the service response.
+    if hasattr(bridge, "find_boards") and not result.board_boxes:
+        try:
+            result.board_boxes = list(bridge.find_boards(frame))
+        except Exception:                              # noqa: BLE001
+            pass
+    return result
+
+
 def process_video(
     video_bytes: bytes,
     bridge: Pipeline,
@@ -349,9 +641,10 @@ def process_video(
     criteria: InspectionCriteria | None = None,
     mode: str = "module",
     do_preprocess: bool = True,
-    do_align: bool = False,
+    do_align: bool = True,
     frame_stride: int = 5,
     max_frames: int | None = 150,
+    confirm_frames: int = 2,
     confidence: float = 0.25,
     iou: float = 0.45,
     progress: Callable[[float, str], None] | None = None,
@@ -366,15 +659,21 @@ def process_video(
         criteria: acceptance rules applied to every analysed frame.
         mode: pipeline execution mode, passed through to the bridge.
         do_preprocess: run Module 1 on each frame.
-        do_align: run Module 2 on each frame. Off by default — a conveyor stream
-            rarely presents a clean four-corner board boundary, and a failed
-            alignment on every frame only slows the run down.
+        do_align: run Module 2 on each frame. Each detected board is
+            straightened in place before detection, so conveyor footage with
+            several boards is handled too (aligning the whole multi-board frame
+            would be a no-op).
         frame_stride: analyse every *n*-th frame. Frames in between are written
             to the output carrying the most recent annotation, which keeps the
             output playing at the original speed without paying for detection on
             every frame.
         max_frames: stop after this many *analysed* frames, so a long clip cannot
             hang the interface. ``None`` processes the whole video.
+        confirm_frames: temporal smoothing. The same board is analysed several
+            times as it travels, and a defect is only reported once it has been
+            seen in this many analyses of one board — random one-off findings
+            (typical at the confidence threshold) never survive. ``1`` disables
+            smoothing and reports every per-frame detection.
         confidence: detector confidence threshold.
         iou: detector NMS IoU threshold.
         progress: optional callback receiving ``(fraction, message)`` for the
@@ -397,6 +696,12 @@ def process_video(
     worst_frame: np.ndarray | None = None
     worst_score = 101.0
     worst_caption = ""
+
+    # Board-anchored consensus: a defect is reported only after it has been
+    # observed across `confirm_frames` analyses of the same board, and its mark
+    # is re-projected onto the board's current rectangle so it always stays on
+    # the board while it moves (see BoardAnchoredConsensus).
+    consensus = BoardAnchoredConsensus(confirm=max(1, int(confirm_frames)))
 
     try:
         capture = cv2.VideoCapture(input_path)
@@ -423,34 +728,68 @@ def process_video(
             frames_read += 1
 
             if frames_read % stride == 1 or stride == 1:
-                stages = bridge.run(frame, mode=mode,
-                                    do_preprocess=do_preprocess, do_align=do_align)
-                # Student 1's own check (StageResult.pcb_valid) plus this
-                # repository's independent second opinion (hue concentration +
-                # texture) — either one rejecting is enough.
-                pcb_valid, pcb_message = pcb_check.evaluate(
-                    stages.pcb_valid, stages.pcb_message, stages.original
-                )
-                if pcb_valid is False:
-                    # Rejected before Modules 1-3 did any work on this frame —
-                    # see core.analysis.rejected.
+                stages = stage_frame(bridge, frame, mode=mode,
+                                     do_preprocess=do_preprocess,
+                                     do_align=do_align)
+                if stages.pcb_valid is False:
+                    # Student 1's validate_pcb_image() rejected this frame
+                    # before Modules 1-3 did any work on it — see
+                    # StageResult.pcb_valid / core.analysis.rejected. Only
+                    # reached when stage_frame() fell back to bridge.run():
+                    # a frame stage_frame() already resolved to 2+ real boards
+                    # never goes through this single-board check at all.
                     image_shape = stages.final.shape[:2] if stages.final is not None else (0, 0)
                     detection_result = DetectionResult(
                         detections=[], inference_ms=0.0, image_shape=image_shape,
                         model_name=detector.model_name, error=None,
                     )
                     summary = rejected(
-                        pcb_message or "Frame does not appear to contain a PCB.",
+                        stages.pcb_message or "Frame does not appear to contain a PCB.",
                         image_shape=image_shape,
                     )
+                    raw_result = detection_result
+                    board_boxes: list[tuple[int, int, int, int]] = []
+                    real_boxes = False
+                    per_board: list[tuple[int, list]] = []
                 else:
-                    detection_result = detector.predict(
+                    raw_result = detector.predict(
                         stages.final, confidence=confidence, iou=iou
+                    )
+                    board_boxes = list(stages.board_boxes)
+                    real_boxes = bool(board_boxes)
+                    if not real_boxes and stages.final is not None:
+                        # The adapter reported no board rectangles (e.g. a minimal
+                        # service omitting the optional "boards" field): anchor to a
+                        # full-frame pseudo-board so marks still render.
+                        fh, fw = stages.final.shape[:2]
+                        board_boxes = [(0, 0, fw, fh)]
+                    consensus.update(board_boxes, raw_result.detections, frames_analysed)
+                    per_board = consensus.render_by_board(board_boxes, frames_analysed)
+                    stable = [d for _bid, dets in per_board for d in dets]
+                    detection_result = DetectionResult(
+                        stable, raw_result.inference_ms, raw_result.image_shape,
+                        raw_result.model_name, error=raw_result.error,
                     )
                     summary = summarise(detection_result, criteria)
                 summaries.append(summary)
 
                 timestamp = (frames_read - 1) / fps if fps else 0.0
+                board_records: list[BoardRecord] = []
+                for (board_id, dets), board_box in zip(per_board, board_boxes):
+                    board_summary = summarise(
+                        DetectionResult(dets, raw_result.inference_ms,
+                                        raw_result.image_shape,
+                                        raw_result.model_name, raw_result.error),
+                        criteria,
+                    )
+                    board_records.append(BoardRecord(
+                        label=f"Board {board_id + 1}",
+                        verdict=board_summary.verdict,
+                        defect_count=board_summary.total_defects,
+                        quality_score=board_summary.quality_score,
+                        confidence=max((d.confidence for d in dets), default=0.0),
+                        class_counts=dict(board_summary.class_counts),
+                    ))
                 records.append(
                     FrameRecord(
                         frame_index=frames_read,
@@ -459,10 +798,17 @@ def process_video(
                         defect_count=summary.total_defects,
                         quality_score=summary.quality_score,
                         class_counts=dict(summary.class_counts),
+                        boards=board_records,
                     )
                 )
 
                 annotated = draw_detections(stages.final, detection_result.detections)
+                if per_board and real_boxes:
+                    annotated = draw_board_labels(
+                        annotated,
+                        [(box, f"Board {board_id + 1}")
+                         for (board_id, _dets), box in zip(per_board, board_boxes)],
+                    )
                 annotated = draw_verdict_banner(
                     annotated,
                     summary.verdict,

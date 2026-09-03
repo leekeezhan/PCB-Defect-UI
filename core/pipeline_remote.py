@@ -409,6 +409,18 @@ class RemotePipeline:
                 "The service returned no usable image — detection ran on the raw image."
             )
 
+        # Optional board rectangles (x, y, w, h), so detection marks can be
+        # anchored to the boards even when they move between frames.
+        boards = payload.get("boards")
+        if isinstance(boards, (list, tuple)):
+            for entry in boards:
+                try:
+                    bx, by, bw, bh = (int(v) for v in entry)
+                except (TypeError, ValueError):
+                    continue
+                if bw > 0 and bh > 0:
+                    result.board_boxes.append((bx, by, bw, bh))
+
         for note in payload.get("notes") or []:
             text = str(note).strip()
             if text:

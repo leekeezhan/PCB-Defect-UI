@@ -691,9 +691,15 @@ def test_storage() -> None:
         again = storage.create_store("sqlite", sqlite_path=path)
         check(again.available, "re-opening an existing database succeeds")
 
-    unwritable = storage.create_store("sqlite", sqlite_path="/proc/nope/history.db")
+    # A path whose parent is an existing FILE cannot be created on any
+    # platform (on Windows a Linux-style "/proc/nope" is drive-relative and
+    # can actually be created, so it is not reliably unwritable there).
+    with tempfile.NamedTemporaryFile(delete=False) as handle:
+        blocker = Path(handle.name)
+    unwritable = storage.create_store("sqlite", sqlite_path=str(blocker / "history.db"))
     check(not unwritable.available, "an unwritable path degrades rather than raising")
     check(unwritable.log_many([]) == 0, "logging to a failed store is safe")
+    blocker.unlink(missing_ok=True)
 
     supabase = storage.create_store("supabase", supabase_url="", supabase_key="")
     check(not supabase.available, "Supabase without credentials is unavailable")

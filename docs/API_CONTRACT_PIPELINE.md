@@ -54,6 +54,19 @@ sampled frame on the video and live pages.
 Both stages travel in **one** request. The video page calls this per frame; a
 second round trip per frame would double the latency for nothing.
 
+**Multi-board frames.** The video and live pages send the WHOLE camera/conveyor
+frame, which can hold two or more boards. Module 2 resolves a *single* board
+quadrilateral, so aligning such a frame as a whole is a no-op. A conforming
+service must therefore rectify every board **in place**: detect each board
+region, warp every board onto the axis-aligned rectangle that bounds it, and
+keep the rest of the frame untouched — so `final` (what Module 3 detects on) is
+the original picture with every board at its correct angle. A frame with one
+board keeps the simple behaviour. A board cut off by the camera frame edge is
+aligned to its visible orientation (the board's rotation is still recoverable
+from its contour); a board whose orientation really cannot be resolved stays as
+seen, with `notes` explaining it. The interface rectifies the same way when the
+pipeline runs locally, so the two paths agree.
+
 **Request:** `multipart/form-data`
 
 | Part | Type | Notes |
@@ -70,6 +83,7 @@ second round trip per frame would double the latency for nothing.
   "preprocessed": "<base64 image>",
   "aligned": "<base64 image>",
   "final": "<base64 image>",
+  "boards": [[261, 104, 515, 512], [901, 104, 379, 512]],
   "notes": ["No four-corner boundary found; returned the pre-processed image."],
   "elapsed_ms": 18.4,
   "mode": "module"
@@ -81,6 +95,7 @@ second round trip per frame would double the latency for nothing.
 | `final` | **strongly recommended** | The image Module 3 should detect on. When absent the client falls back to `aligned`, then `preprocessed`, then the original — so a service that returns only the two stages still works, but say what you mean. |
 | `preprocessed` | no | Module 1's output. `null` when the stage was skipped or produced nothing. Also accepted as `preprocessed_image` or `module1`. |
 | `aligned` | no | Module 2's output. `null` is the correct answer when no board boundary was found — that is a normal outcome, not an error. Also accepted as `aligned_image` or `module2`. |
+| `boards` | no | List of `[x, y, w, h]` rectangles, one per board detected in the frame (preferably the same rectangles the service rectified). The interface anchors detection marks to these rectangles, so marks stay on the boards while they move. Omit to fall back to raw pixel prediction. |
 | `notes` | no | Strings shown to the operator alongside the result and printed in the PDF report. This is where "CLAHE clip limit raised for a dark capture" or "board boundary found at 3 corners only" belongs. |
 | `elapsed_ms` | no | Your own timing. The client reports the round trip when it is absent. |
 | `mode` | no | What you actually ran. |
@@ -115,7 +130,10 @@ from fastapi import FastAPI, File, Form, UploadFile
 # --- your code -------------------------------------------------------------- #
 # Both take a BGR numpy array and return one. align_image returns None when it
 # cannot find a four-corner board boundary — that is a valid answer.
-from image_pipeline import align_image, preprocess_image
+# rectify_frame(img) -> (rectified, num_boards, notes): warps every board of a
+# multi-board frame onto its own axis-aligned rectangle IN PLACE, so the frame
+# keeps its layout with every board upright.
+from image_pipeline import align_image, find_boards, preprocess_image, rectify_frame
 
 app = FastAPI(title="PCB pipeline service — Modules 1 & 2")
 
@@ -154,25 +172,42 @@ async def process(
     notes = []
     working = original
     preprocessed = aligned = None
+    do_preprocess = preprocess.lower() == "true"
+    do_align = align.lower() == "true"
 
-    if preprocess.lower() == "true":
-        preprocessed = preprocess_image(original)          # Module 1
+    if do_preprocess:
+        preprocessed = preprocess_image(original)        # Module 1
         if preprocessed is None:
             notes.append("Module 1 returned nothing; the original image was kept.")
         else:
             working = preprocessed
 
-    if align.lower() == "true":
-        aligned = align_image(working)                     # Module 2
-        if aligned is None:
-            notes.append("No four-corner board boundary was found.")
+    if do_align:
+        # Several boards per frame: rectify every board IN PLACE (the frame
+        # keeps its layout with each board upright); a single-board frame
+        # falls back to whole-image alignment.
+        rectified, num_boards, rect_notes = rectify_frame(working)
+        notes.extend(rect_notes)
+        if num_boards > 1:
+            aligned = rectified
+            working = rectified
         else:
-            working = aligned
+            aligned = align_image(working)               # Module 2
+            if aligned is None:
+                notes.append("No four-corner board boundary was found.")
+            else:
+                working = aligned
+
+    try:
+        board_boxes = [[int(v) for v in b] for b in (find_boards(original) or [])]
+    except Exception:                                    # noqa: BLE001
+        board_boxes = []
 
     return {
         "preprocessed": _encode(preprocessed),
         "aligned": _encode(aligned),
         "final": _encode(working),
+        "boards": board_boxes,
         "notes": notes,
         "elapsed_ms": (time.perf_counter() - started) * 1000,
         "mode": "module",
