@@ -715,10 +715,19 @@ def page_video(bridge: Pipeline, detector, settings: Settings, store) -> None:
                         disabled=not video_bytes)
 
     align_in_video = st.checkbox(
-        "Apply Module 2 alignment to every frame", value=False,
-        help="A conveyor stream rarely presents a clean four-corner board "
-             "boundary, so alignment usually fails per frame and only slows the "
-             "run down. Enable it for footage of stationary boards.",
+        "Apply Module 2 alignment to every frame", value=True,
+        help="Each detected board is straightened in place before detection "
+             "— conveyor footage with several boards is handled automatically. "
+             "Disable it to skip alignment and only pre-process.",
+    )
+
+    confirm_frames = st.slider(
+        "Confirm a defect across analyses", 1, 5, 2,
+        help="The same board is inspected several times as it travels. A defect "
+             "is reported only once it has been seen in this many analyses of "
+             "the same board, so one-off findings — usually flicker right at "
+             "the confidence threshold — are dropped and the verdicts stay "
+             "stable frame to frame. 1 = report every frame as-is.",
     )
 
     if run and video_bytes:
@@ -738,6 +747,7 @@ def page_video(bridge: Pipeline, detector, settings: Settings, store) -> None:
                 do_align=align_in_video,
                 frame_stride=int(stride),
                 max_frames=int(max_frames),
+                confirm_frames=int(confirm_frames),
                 confidence=settings.confidence,
                 iou=settings.iou,
                 progress=report_progress,
@@ -1188,6 +1198,73 @@ def _render_video_result(stored: dict[str, Any]) -> None:
         with st.expander("Per-frame results"):
             st.dataframe(frame, use_container_width=True, hide_index=True, height=300)
 
+        # -- Board results: per board, aggregated over the whole run ---------- #
+        board_entries: dict[str, list[tuple[FrameRecord, BoardRecord]]] = {}
+        for record in result.records:
+            for board in record.boards:
+                board_entries.setdefault(board.label, []).append((record, board))
+
+        if board_entries:
+            section("Board results")
+            labels = sorted(
+                board_entries,
+                key=lambda label: int(label.rsplit(" ", 1)[1])
+                if label.rsplit(" ", 1)[1].isdigit() else 0,
+            )
+            selected = st.selectbox(
+                "Select board",
+                labels,
+                help="Each board keeps the same label for its whole trip through "
+                     "the frame, so its results are aggregated across every "
+                     "analysed frame it appeared in.",
+            )
+            entries = board_entries[selected]
+            verdicts = [board.verdict for _record, board in entries]
+            overall = (
+                "FAIL" if "FAIL" in verdicts
+                else ("REVIEW" if "REVIEW" in verdicts else "PASS")
+            )
+            counts = [board.defect_count for _record, board in entries]
+            confidences = [board.confidence for _record, board in entries
+                           if board.confidence > 0.0]
+
+            columns = st.columns(6)
+            columns[0].metric("Frames seen", len(entries))
+            columns[1].metric("Max defects", max(counts, default=0))
+            columns[2].metric("Min defects", min(counts, default=0))
+            columns[3].metric(
+                "Avg defects", round(sum(counts) / len(counts), 2) if counts else 0.0
+            )
+            columns[4].metric(
+                "Best confidence", f"{max(confidences, default=0.0):.2f}"
+            )
+            columns[5].metric("Overall", overall)
+            st.caption(
+                f"{selected} was seen in {len(entries)} analysed frame(s). "
+                "Overall is FAIL if the board failed any of them, REVIEW if it "
+                "was only ever flagged for review, PASS otherwise; confidence is "
+                "the strongest confirmed detection on the board."
+            )
+
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "frame": record.frame_index,
+                        "time_s": round(record.timestamp_s, 2),
+                        **board.as_row(),
+                    }
+                    for record, board in entries
+                ]),
+                use_container_width=True, hide_index=True, height=260,
+            )
+            st.caption(
+                "Per-frame detail for the selected board — the coloured tag in "
+                "the annotated stream matches the label here."
+            )
+        else:
+            with st.expander("Per-board results"):
+                st.caption("No board was identified in this run.")
+
         batch = analysis.summarise_batch(result.summaries)
         section("Export")
         rows = [
@@ -1320,9 +1397,9 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
         )
     with controls[2]:
         align_live = st.checkbox(
-            "Apply Module 2 alignment", value=False, disabled=running,
-            help="A hand-held board rarely presents a clean four-corner boundary, "
-                 "so alignment usually fails per frame and only costs time.",
+            "Apply Module 2 alignment", value=True, disabled=running,
+            help="Each detected board is straightened in place before "
+                 "detection; several boards in view are handled together.",
         )
     with controls[3]:
         st.write("")
@@ -1334,9 +1411,19 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
         st.write("")
         stop = st.button("■ Stop", use_container_width=True, disabled=not running)
 
+    confirm_live = st.slider(
+        "Confirm a defect across analyses", 1, 5, 2, disabled=running,
+        help="A defect is reported only after it has been seen in this many "
+             "analyses of the same board, so one-off findings — usually flicker "
+             "at the confidence threshold — are dropped.",
+    )
+
     if start:
         st.session_state["live_running"] = True
         st.session_state["live_stats"] = live.LiveStats()
+        st.session_state["live_consensus"] = live.BoardAnchoredConsensus(
+            confirm=max(1, int(confirm_live))
+        )
         st.session_state["live_capture"] = live.open_camera(int(camera_index))
         st.rerun()
 
@@ -1360,6 +1447,7 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
         )
         frame_slot = st.empty()
         metric_slot = st.empty()
+        boards_slot = st.empty()
 
         def on_frame(annotated, summary) -> None:
             frame_slot.image(viz.to_rgb(annotated), use_container_width=True)
@@ -1369,6 +1457,16 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
                 columns[1].metric("Defects in frame", summary.total_defects)
                 columns[2].metric("Frames inspected", stats.frames)
                 columns[3].metric("Effective rate", f"{stats.effective_fps:.1f} /s")
+
+        def on_boards(boards) -> None:
+            if boards:
+                boards_slot.markdown("&nbsp;·&nbsp;".join(
+                    f"**{board.label}** {board.verdict} — {board.defect_count} "
+                    f"defect(s)"
+                    for board in boards
+                ))
+            else:
+                boards_slot.caption("No board identified in this frame")
 
         chunk = live.run_chunk(
             capture,
@@ -1381,11 +1479,14 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
             mode=settings.mode,
             do_preprocess=settings.do_preprocess,
             do_align=bool(align_live),
+            confirm_frames=int(confirm_live),
             confidence=settings.confidence,
             iou=settings.iou,
             show_labels=settings.show_labels,
             show_confidence=settings.show_confidence,
+            consensus=st.session_state.get("live_consensus"),
             on_frame=on_frame,
+            on_boards=on_boards,
         )
 
         # Persist this chunk's frames in one write rather than one per frame.

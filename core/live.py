@@ -35,11 +35,13 @@ import cv2
 import numpy as np
 
 from .analysis import InspectionCriteria, InspectionSummary, summarise
+from .detector import DetectionResult
 from .pipeline_bridge import PipelineBridge  # noqa: F401  (documents the contract)
+from .video import BoardAnchoredConsensus, BoardRecord, stage_frame
 
 #: Either pipeline adapter — the HTTP client or the local bridge.
 Pipeline = Any
-from .viz import draw_detections, draw_verdict_banner
+from .viz import draw_board_labels, draw_detections, draw_verdict_banner
 
 #: How many camera indices to probe when looking for attached devices.
 MAX_CAMERA_INDEX = 4
@@ -224,6 +226,7 @@ class ChunkResult:
     frames_processed: int
     last_annotated: np.ndarray | None
     last_summary: InspectionSummary | None
+    last_boards: list[BoardRecord] = field(default_factory=list)
     error: str | None = None
 
 
@@ -240,12 +243,15 @@ def run_chunk(
     target_fps: float = 4.0,
     mode: str = "module",
     do_preprocess: bool = True,
-    do_align: bool = False,
+    do_align: bool = True,
+    confirm_frames: int = 2,
     confidence: float = 0.25,
     iou: float = 0.45,
     show_labels: bool = True,
     show_confidence: bool = True,
+    consensus: BoardAnchoredConsensus | None = None,
     on_frame: Callable[[np.ndarray, InspectionSummary], None] | None = None,
+    on_boards: Callable[[list[BoardRecord]], None] | None = None,
 ) -> ChunkResult:
     """
     Capture and inspect frames for a bounded slice of time.
@@ -264,15 +270,21 @@ def run_chunk(
             every frame the camera offers.
         mode: pipeline execution mode.
         do_preprocess: run Module 1 on each frame.
-        do_align: run Module 2 on each frame. Off by default — a hand-held board
-            rarely presents a clean four-corner boundary, and a failed alignment
-            on every frame only costs time.
+        do_align: run Module 2 on each frame. Each detected board is
+            straightened in place before detection.
+        confirm_frames: temporal smoothing — a defect is only reported once it
+            has been seen in this many analyses of the same board. ``1``
+            disables it.
         confidence: detector confidence threshold.
         iou: detector NMS IoU threshold.
         show_labels: label each bounding box.
         show_confidence: append the score to each label.
+        consensus: the board-anchored consensus shared across chunks (held in
+            session state, like stats); created on the fly when ``None``.
         on_frame: called with ``(annotated, summary)`` after each inspected
             frame, so the interface can update its placeholders mid-chunk.
+        on_boards: called with the per-board records of each frame, so the
+            interface can show one result per board.
 
     Returns:
         A :class:`ChunkResult`. A camera that stops delivering frames is
@@ -282,9 +294,13 @@ def run_chunk(
     deadline = time.time() + max(0.2, float(seconds))
     interval = 1.0 / max(0.5, float(target_fps))
 
+    if consensus is None:
+        consensus = BoardAnchoredConsensus(confirm=max(1, int(confirm_frames)))
+
     processed = 0
     last_annotated: np.ndarray | None = None
     last_summary: InspectionSummary | None = None
+    last_boards: list[BoardRecord] = []
     error: str | None = None
 
     while time.time() < deadline:
@@ -295,16 +311,58 @@ def run_chunk(
             error = "The camera stopped delivering frames."
             break
 
-        stages = bridge.run(frame, mode=mode, do_preprocess=do_preprocess, do_align=do_align)
-        detection_result = detector.predict(stages.final, confidence=confidence, iou=iou)
+        stages = stage_frame(bridge, frame, mode=mode,
+                             do_preprocess=do_preprocess, do_align=do_align)
+        raw_result = detector.predict(stages.final, confidence=confidence, iou=iou)
+
+        # Board-anchored temporal consensus — same stabilisation the video page
+        # uses: defects are matched per board and only reported after
+        # `confirm_frames` analyses, and marks are re-projected onto the
+        # board's current rectangle so they stay glued to the moving board.
+        board_boxes = list(stages.board_boxes)
+        real_boxes = bool(board_boxes)
+        if not real_boxes and stages.final is not None:
+            fh, fw = stages.final.shape[:2]
+            board_boxes = [(0, 0, fw, fh)]
+        frame_index = stats.frames
+        consensus.update(board_boxes, raw_result.detections, frame_index)
+        per_board = consensus.render_by_board(board_boxes, frame_index)
+        stable = [d for _bid, dets in per_board for d in dets]
+        detection_result = DetectionResult(
+            stable, raw_result.inference_ms, raw_result.image_shape,
+            raw_result.model_name, error=raw_result.error,
+        )
         summary = summarise(detection_result, criteria)
+
+        boards: list[BoardRecord] = []
+        for (board_id, dets), board_box in zip(per_board, board_boxes):
+            board_summary = summarise(
+                DetectionResult(dets, raw_result.inference_ms,
+                                raw_result.image_shape,
+                                raw_result.model_name, raw_result.error),
+                criteria,
+            )
+            boards.append(BoardRecord(
+                label=f"Board {board_id + 1}",
+                verdict=board_summary.verdict,
+                defect_count=board_summary.total_defects,
+                quality_score=board_summary.quality_score,
+                confidence=max((d.confidence for d in dets), default=0.0),
+                class_counts=dict(board_summary.class_counts),
+            ))
 
         annotated = draw_detections(
             stages.final,
-            detection_result.detections,
+            stable,
             show_labels=show_labels,
             show_confidence=show_confidence,
         )
+        if per_board and real_boxes:
+            annotated = draw_board_labels(
+                annotated,
+                [(box, f"Board {board_id + 1}")
+                 for (board_id, _dets), box in zip(per_board, board_boxes)],
+            )
         annotated = draw_verdict_banner(
             annotated,
             summary.verdict,
@@ -313,10 +371,12 @@ def run_chunk(
 
         stats.record(summary, annotated)
         processed += 1
-        last_annotated, last_summary = annotated, summary
+        last_annotated, last_summary, last_boards = annotated, summary, boards
 
         if on_frame is not None:
             on_frame(annotated, summary)
+        if on_boards is not None:
+            on_boards(boards)
 
         # Pace the loop to the requested inspection rate. When detection already
         # took longer than the interval, continue immediately.
@@ -324,4 +384,4 @@ def run_chunk(
         if remaining > 0:
             time.sleep(min(remaining, max(0.0, deadline - time.time())))
 
-    return ChunkResult(processed, last_annotated, last_summary, error)
+    return ChunkResult(processed, last_annotated, last_summary, last_boards, error)

@@ -164,6 +164,9 @@ class StageResult:
     notes: list[str] = field(default_factory=list)
     mode: str = MODE_MODULE
     elapsed_ms: float = 0.0
+    #: Board rectangles ``(x, y, w, h)`` detected in this frame, so detection
+    #: marks can be anchored to the boards (the boards move along the conveyor).
+    board_boxes: list[tuple[int, int, int, int]] = field(default_factory=list)
 
     @property
     def preprocess_ok(self) -> bool:
@@ -317,6 +320,39 @@ class PipelineBridge:
             return None
         try:
             return self._module.align_image(image)
+        except Exception:                  # noqa: BLE001
+            return None
+
+    def find_boards(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """
+        Locate every PCB board in a frame — multi-board conveyor frames
+        included. Returns ``(x, y, w, h)`` boxes, left to right, and an empty
+        list when the module is unavailable or no board is present.
+
+        Used by the video and live pages so each board is straightened in place
+        instead of aligning the whole multi-board frame.
+        """
+        if not self._has("find_boards"):
+            return []
+        try:
+            return list(self._module.find_boards(image))
+        except Exception:                  # noqa: BLE001
+            return []
+
+    def rectify_frame(self, image: np.ndarray) -> np.ndarray | None:
+        """
+        Rectify EVERY board of a multi-board frame IN PLACE (Module 2): each
+        board is warped onto the axis-aligned rectangle that bounds it, so the
+        frame keeps its original layout with every board at its correct angle.
+
+        Returns ``None`` when the module is unavailable or the frame has zero
+        or one board — the caller then uses :meth:`align` as usual.
+        """
+        if not self._has("rectify_frame"):
+            return None
+        try:
+            rectified, num_boards, _notes = self._module.rectify_frame(image)
+            return rectified if num_boards > 1 else None
         except Exception:                  # noqa: BLE001
             return None
 

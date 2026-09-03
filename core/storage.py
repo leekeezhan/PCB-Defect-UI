@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -218,7 +219,7 @@ class SQLiteStore:
         self._ready = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 connection.executescript(self._SCHEMA)
             self._ready = True
         except Exception as exc:                             # noqa: BLE001
@@ -227,7 +228,12 @@ class SQLiteStore:
     def _connect(self) -> sqlite3.Connection:
         # check_same_thread=False because Streamlit serves each interaction from
         # a worker thread, while the store itself is cached across them.
-        connection = sqlite3.connect(str(self.path), timeout=10.0, check_same_thread=False)
+        # isolation_level=None commits each statement immediately, so the
+        # connection can be closed (and the file released) as soon as the call
+        # returns — on Windows an unclosed handle keeps the file locked.
+        connection = sqlite3.connect(
+            str(self.path), timeout=10.0, check_same_thread=False, isolation_level=None
+        )
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -260,7 +266,7 @@ class SQLiteStore:
                 tuple(record.as_payload()[column] for column in self._COLUMNS)
                 for record in records
             ]
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 connection.executemany(statement, rows)
             return len(rows)
         except Exception as exc:                             # noqa: BLE001
@@ -271,7 +277,7 @@ class SQLiteStore:
         if not self.available:
             return []
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 cursor = connection.execute(
                     "SELECT * FROM inspections ORDER BY id DESC LIMIT ?", (int(limit),)
                 )
@@ -284,7 +290,7 @@ class SQLiteStore:
         if not self._ready:
             return 0
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 return int(connection.execute("SELECT COUNT(*) FROM inspections").fetchone()[0])
         except Exception:                                    # noqa: BLE001
             return 0
@@ -293,7 +299,7 @@ class SQLiteStore:
         if not self.available:
             return False
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 connection.execute("DELETE FROM inspections")
             return True
         except Exception as exc:                             # noqa: BLE001

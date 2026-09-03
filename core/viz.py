@@ -127,6 +127,65 @@ def draw_detections(
     return canvas
 
 
+#: BGR palette for board tags, so several boards in one frame are easy to tell apart.
+_BOARD_TAG_COLORS = [
+    (41, 128, 185),    # blue
+    (211, 84, 0),      # orange
+    (39, 174, 96),     # green
+    (142, 68, 173),    # purple
+    (192, 57, 43),     # red
+    (243, 156, 18),    # amber
+]
+
+
+def draw_board_labels(
+    image: np.ndarray,
+    labelled_boxes: Sequence[tuple[tuple[int, int, int, int], str]],
+) -> np.ndarray:
+    """
+    Draw a coloured tag with its label on to each board rectangle.
+
+    ``labelled_boxes`` is a sequence of ``((x, y, w, h), label)``. The tags use
+    the same palette as the per-board results table, so the label on the video
+    and the row in the results table always match.
+
+    Returns:
+        A new BGR array with the tags drawn on it.
+    """
+    canvas = image.copy()
+    scale = _scaled(canvas)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45 * scale
+    text_thickness = max(1, int(round(1 * scale)))
+    pad = max(2, int(round(3 * scale)))
+
+    for i, ((x, y, w, h), label) in enumerate(labelled_boxes):
+        colour = _BOARD_TAG_COLORS[i % len(_BOARD_TAG_COLORS)]
+        (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale,
+                                                     text_thickness)
+        x0 = max(0, int(round(x)))
+        y0 = max(0, int(round(y)))
+        cv2.rectangle(
+            canvas,
+            (x0, y0),
+            (min(canvas.shape[1], x0 + text_w + 2 * pad),
+             min(canvas.shape[0], y0 + text_h + baseline + 2 * pad)),
+            colour,
+            cv2.FILLED,
+        )
+        cv2.putText(
+            canvas,
+            label,
+            (x0 + pad, max(text_h, y0 + text_h + pad)),
+            font,
+            font_scale,
+            (255, 255, 255),
+            text_thickness,
+            cv2.LINE_AA,
+        )
+    return canvas
+
+
 def draw_verdict_banner(
     image: np.ndarray,
     verdict: str,

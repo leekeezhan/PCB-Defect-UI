@@ -140,6 +140,23 @@ def _decode_upload(data: bytes) -> np.ndarray | None:
     return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
 
+def _rectify_multi_board(frame: np.ndarray) -> tuple[np.ndarray | None, list[str]]:
+    """
+    Rectify EVERY board of a multi-board frame IN PLACE (see
+    ``image_pipeline.rectify_frame``): each board is warped onto the
+    axis-aligned rectangle that bounds it, so the result is the ORIGINAL
+    picture with every board at its correct angle. The detector is then run on
+    this rectified frame.
+
+    Returns ``(None, notes)`` for frames with zero or one board.
+    """
+    try:
+        rectified, num_boards, notes = _CONTRACT.rectify_frame(frame)
+        return (rectified, notes) if num_boards > 1 else (None, notes)
+    except Exception as exc:                                    # noqa: BLE001
+        return None, [f"Rectification failed: {type(exc).__name__}: {exc}"]
+
+
 def _encode(image: np.ndarray | None) -> str | None:
     if image is None:
         return None
@@ -212,28 +229,48 @@ async def process(
     pre_image: np.ndarray | None = None
     aligned_image: np.ndarray | None = None
 
-    if preprocess.lower() == "true":
+    do_preprocess = preprocess.lower() == "true"
+    do_align = align.lower() == "true"
+
+    # Board rectangles, returned so the interface can anchor detection marks
+    # to the boards even while they move along the conveyor.
+    try:
+        boxes = [[int(v) for v in b] for b in (_CONTRACT.find_boards(original) or [])]
+    except Exception:                                        # noqa: BLE001
+        boxes = []
+
+    if do_preprocess:
         pre_image = _CONTRACT.preprocess_image(original)
         if pre_image is None:
             notes.append("Module 1 returned nothing; the original image was kept.")
         else:
             working = pre_image
 
-    if align.lower() == "true":
-        aligned_image = _CONTRACT.align_image(working)
-        if aligned_image is None:
-            notes.append(
-                "No four-corner board boundary was found; the frame was scaled "
-                "to the detector's expected size instead of being aligned."
-            )
-            working = _scale_to_align_target(working)
+    if do_align:
+        # Several boards per frame: rectify every board IN PLACE (the frame
+        # keeps its layout with each board upright). This is a no-op for a
+        # single-board frame, which falls through to the usual alignment.
+        rectified, rect_notes = _rectify_multi_board(working)
+        notes.extend(rect_notes)
+        if rectified is not None:
+            aligned_image = rectified
+            working = rectified
         else:
-            working = aligned_image
+            aligned_image = _CONTRACT.align_image(working)
+            if aligned_image is None:
+                notes.append(
+                    "No four-corner board boundary was found; the frame was scaled "
+                    "to the detector's expected size instead of being aligned."
+                )
+                working = _scale_to_align_target(working)
+            else:
+                working = aligned_image
 
     return {
         "preprocessed": _encode(pre_image),
         "aligned": _encode(aligned_image),
         "final": _encode(working),
+        "boards": boxes,
         "notes": notes,
         "elapsed_ms": (time.perf_counter() - started) * 1000,
         "mode": "module",
