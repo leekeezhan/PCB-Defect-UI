@@ -125,6 +125,12 @@ LIVE_RECORD_MAX_FRAMES = 900
 LIVE_PREVIEW_WIDTH = 720
 LIVE_PREVIEW_FPS = 15.0
 
+#: Whether the Live page offers continuous capture alongside Snapshot.
+#: Switched off: the camera path and its board-by-board pass are kept in
+#: this file (_live_stream and below) and are re-enabled by setting this to
+#: True — nothing else needs changing.
+LIVE_CONTINUOUS_ENABLED = False
+
 #: Either Modules 1 & 2 adapter — ``core.pipeline_remote.RemotePipeline``
 #: (the default) or ``core.pipeline_bridge.PipelineBridge``. They expose the
 #: same surface, so no page needs to know which one it is holding.
@@ -1463,23 +1469,33 @@ def _render_video_result(stored: dict[str, Any]) -> None:
 def page_live(bridge: Pipeline, detector, settings: Settings, store) -> None:
     """Real-time inspection from a camera attached to this machine."""
     st.markdown("#### Live inspection")
-    st.caption(
-        "Inspect a board as the camera sees it. Snapshot mode works in any "
-        "browser; continuous mode drives a camera attached to the machine "
-        "running this interface."
-    )
+    if LIVE_CONTINUOUS_ENABLED:
+        st.caption(
+            "Inspect a board as the camera sees it. Snapshot mode works in any "
+            "browser; continuous mode drives a camera attached to the machine "
+            "running this interface."
+        )
+    else:
+        st.caption(
+            "Inspect a board as the camera sees it. The photograph is taken in "
+            "the browser, so this works whichever machine the page is open on."
+        )
     _fast_model_note(settings)
 
-    capture_mode = st.radio(
-        "Capture mode",
-        ["Snapshot", "Continuous stream"],
-        horizontal=True,
-        key="live_mode",
-        help="Snapshot takes one photograph through the browser and inspects it "
-             "like any uploaded board. Continuous stream records from a camera "
-             "attached to this machine, showing the live view while it records, "
-             "and inspects the whole recording board by board when you stop.",
-    )
+    modes = ["Snapshot"] + (["Continuous stream"] if LIVE_CONTINUOUS_ENABLED else [])
+    if len(modes) > 1:
+        capture_mode = st.radio(
+            "Capture mode", modes, horizontal=True, key="live_mode",
+            help="Snapshot takes one photograph through the browser and inspects "
+                 "it like any uploaded board. Continuous stream records from a "
+                 "camera attached to this machine, showing the live view while "
+                 "it records, and inspects the whole recording board by board "
+                 "when you stop.",
+        )
+    else:
+        # A one-option radio is just noise, so with continuous capture switched
+        # off the page goes straight to the only mode there is.
+        capture_mode = modes[0]
 
     if capture_mode == "Snapshot":
         _live_snapshot(bridge, detector, settings, store)
