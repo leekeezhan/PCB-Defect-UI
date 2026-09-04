@@ -80,6 +80,7 @@ except ImportError:                                      # noqa: BLE001
     WEBRTC_AVAILABLE = False
 from core.analysis import BatchSummary, InspectionSummary
 from core.detector import DefectDetector, DetectionResult, filter_by_class
+from core.video import BoardRecord, FrameRecord  # noqa: F401  (type hints)
 from core.pipeline_bridge import (
     create_pipeline,
     decode_image,
@@ -129,7 +130,7 @@ LIVE_PREVIEW_FPS = 15.0
 #: Switched off: the camera path and its board-by-board pass are kept in
 #: this file (_live_stream and below) and are re-enabled by setting this to
 #: True — nothing else needs changing.
-LIVE_CONTINUOUS_ENABLED = False
+LIVE_CONTINUOUS_ENABLED = True
 
 #: Either Modules 1 & 2 adapter — ``core.pipeline_remote.RemotePipeline``
 #: (the default) or ``core.pipeline_bridge.PipelineBridge``. They expose the
@@ -380,6 +381,37 @@ def _stage_images(settings: Settings, stages, annotated) -> dict[str, Any]:
         "aligned": getattr(stages, "aligned", None),
         "annotated": annotated,
     }
+
+
+def _display_resolution(
+    annotated: np.ndarray | None,
+    reference: np.ndarray | None,
+) -> np.ndarray | None:
+    """
+    Present a result at the scale of the picture it came from (display only).
+
+    Detection always runs at the scale its training set used
+    (``image_pipeline.ALIGN_TARGET`` = 1280), which can be smaller than the
+    camera frame it was cropped from — a 1920×1080 phone capture produces a
+    1280×~665 aligned board. That is the right input for the model, but it
+    leaves the shown and downloaded result looking downscaled, so the image is
+    resized back uniformly (no stretching) for display and export. The
+    detections, boxes and verdict are those of the 1280 analysis either way.
+    """
+    if annotated is None or reference is None:
+        return annotated
+    ah, aw = annotated.shape[:2]
+    rh, rw = reference.shape[:2]
+    if (ah, aw) == (rh, rw):
+        return annotated
+    scale = max(rw, rh) / max(aw, ah)
+    if abs(scale - 1.0) < 0.01:
+        return annotated
+    return cv2.resize(
+        annotated,
+        (int(round(aw * scale)), int(round(ah * scale))),
+        interpolation=cv2.INTER_CUBIC,
+    )
 
 
 def _attach_images(store, records: list[InspectionRecord], images: list[dict[str, Any]]) -> None:
@@ -981,12 +1013,12 @@ def _render_board_scan(
                              use_container_width=True, key=f"{key_prefix}_run")
 
     include_partial = st.checkbox(
-        "Also inspect boards that are never completely in frame", value=False,
+        "Also inspect boards that are never completely in frame", value=True,
         key=f"{key_prefix}_include_partial",
         help="A board still entering when the clip ends is cut off by the edge "
-             "of the picture. It is found and listed either way; inspecting one "
-             "reports only the defects on the visible part, so the verdict is "
-             "not a verdict on the whole board.",
+             "of the picture. When ticked it is inspected too — the verdict "
+             "then covers only the visible part, so it is not a verdict on the "
+             "whole board. Untick to only judge complete boards.",
     )
 
     if run_scan:
@@ -1026,6 +1058,10 @@ def _render_board_scan(
                 stages, detection_result, summary, annotated = inspect(
                     board["crop"], bridge, detector, settings, do_align=True
                 )
+                # Detection ran at the scale the model was trained on (1280),
+                # but the capture may have been larger — present the annotated
+                # result at the capture's scale so it does not look downscaled.
+                annotated = _display_resolution(annotated, board["crop"])
                 item.update({"stages": stages, "detection": detection_result,
                              "summary": summary, "annotated": annotated})
             else:
@@ -1181,7 +1217,11 @@ def _render_board_pair(item: dict[str, Any], stem: str, key_prefix: str = "") ->
         "no outline": "Module 1 output — Module 2 found no board outline (detector input)",
     }
     columns = st.columns(2)
-    columns[0].image(viz.to_rgb(stages.final), caption=captions[state],
+    # The detector input is kept at the scale the model was trained on;
+    # the side-by-side view shows it at the capture's scale so it does not
+    # look downscaled next to the annotated result.
+    columns[0].image(viz.to_rgb(_display_resolution(stages.final, stages.original)),
+                     caption=captions[state],
                      use_container_width=True)
     columns[1].image(
         viz.to_rgb(item["annotated"]),
@@ -1507,18 +1547,72 @@ def _live_snapshot(bridge: Pipeline, detector, settings: Settings, store) -> Non
     """
     One photograph, inspected exactly like an uploaded board.
 
-    ``st.camera_input`` runs in the browser, so this mode also works when the
-    interface is deployed to a server with no camera of its own.
+    Two capture sources are offered:
+    * **Browser camera** — ``st.camera_input`` runs in the browser, so this
+      also works when the interface is deployed to a server with no camera of
+      its own, and lets a phone's browser be the camera (open the page there).
+    * **Phone camera (stream)** — captures one frame from a phone IP-camera
+      stream (e.g. IP Webcam over the ADB tunnel), so the laptop drives the
+      inspection while the phone supplies the picture.
     """
-    photo = st.camera_input("Point the camera at the board and take a photograph",
-                            key="live_camera_input")
-    if photo is None:
-        st.info("Grant the browser camera access, then take a photograph.", icon="📷")
-        return
+    browser_tab, phone_tab = st.tabs(["Browser camera", "Phone camera (stream)"])
 
-    image = decode_image(photo.getvalue())
+    image: np.ndarray | None = None
+    source_name = "camera_snapshot.jpg"
+
+    with browser_tab:
+        photo = st.camera_input(
+            "Point the camera at the board and take a photograph",
+            key="live_camera_input",
+        )
+        if photo is not None:
+            image = decode_image(photo.getvalue())
+            if image is None:
+                st.error("The photograph could not be decoded.", icon="⛔")
+            else:
+                source_name = "camera_snapshot.jpg"
+        else:
+            st.info("Grant the browser camera access, then take a photograph.",
+                    icon="📷")
+
+    with phone_tab:
+        phone_url = st.text_input(
+            "Phone stream URL",
+            value="http://127.0.0.1:8080/video",
+            key="snap_phone_url",
+            help="IP Webcam (Android): http://<phone-ip>:8080/video — or, over "
+                 "USB, http://127.0.0.1:8080/video after "
+                 "`adb forward tcp:8080 tcp:8080`.",
+        )
+        if st.button("📸 Capture from phone", type="primary",
+                     key="snap_phone_capture"):
+            capture = live.open_stream(phone_url.strip())
+            if capture is None:
+                st.error(
+                    "The phone stream could not be opened. Check the URL, that "
+                    "the phone's IP Webcam server is running, and that the ADB "
+                    "tunnel is still in place "
+                    "(adb forward tcp:8080 tcp:8080).",
+                    icon="⛔",
+                )
+            else:
+                ok, captured = capture.read()
+                capture.release()
+                if not ok or captured is None:
+                    st.error(
+                        "The stream is reachable but no frame arrived. Keep IP "
+                        "Webcam open with the board in view and try again.",
+                        icon="⛔",
+                    )
+                else:
+                    image = captured
+                    source_name = "phone_snapshot.jpg"
+        else:
+            st.caption("Keep IP Webcam running with the board in view, then "
+                       "press **Capture from phone**.")
+
     if image is None:
-        st.error("The photograph could not be decoded.", icon="⛔")
+        st.caption("Use either tab above to capture a photograph.")
         return
 
     with st.spinner("Running Modules 1 → 2 → 3…"):
@@ -1528,7 +1622,7 @@ def _live_snapshot(bridge: Pipeline, detector, settings: Settings, store) -> Non
                   images=[_stage_images(settings, stages, annotated)])
     _render_single_result(
         {
-            "name": "camera_snapshot.jpg",
+            "name": source_name,
             "stages": stages,
             "detections": detection_result.detections,
             "error": detection_result.error,
