@@ -486,24 +486,34 @@ class PipelineBridge:
 
         # -- Module 2 ------------------------------------------------------ #
         if do_align:
-            # Pre-flight: Module 2's corner finder assumes the board is the
-            # DARK side of an Otsu split. On a lit screen or a brightly-lit
-            # board over a dark bench that is inverted, and it warps the frame
-            # around whatever dark shape it traced instead — a different one
-            # almost every frame, which makes a live stream twist and jump.
-            # See core.roi.board_polarity_ok.
+            # Pre-flight: Module 2's corner finder used to assume the board is
+            # the DARK side of an Otsu split. On a lit screen or a
+            # brightly-lit board over a dark bench that assumption inverts, so
+            # the pre-flight used to skip Module 2 entirely (see
+            # core.roi.board_polarity_ok). The corner finder is now polarity-
+            # tolerant — it falls back to the colour (saturation) mask and the
+            # border safeguards precisely so a bright board on a dark
+            # background still straightens — so alignment is attempted either
+            # way and the pre-flight only shapes how the outcome is reported.
             polarity_ok, polarity_reason = board_polarity_ok(working)
-            aligned = self.align(working) if polarity_ok else None
+            aligned = self.align(working)
 
             rejection: str | None = None
-            if not polarity_ok:
-                rejection = (
-                    f"Module 2 was skipped for this frame because {polarity_reason}. "
-                    "Put the board on a light background to align it."
-                )
-            elif aligned is None:
-                rejection = (
-                    "Module 2 could not resolve a four-corner board boundary."
+            if aligned is None:
+                if polarity_ok:
+                    rejection = (
+                        "Module 2 could not resolve a four-corner board boundary."
+                    )
+                else:
+                    rejection = (
+                        f"Module 2 could not resolve a boundary — suspected "
+                        f"inverted lighting ({polarity_reason})."
+                    )
+            elif not polarity_ok:
+                result.notes.append(
+                    "Module 2 succeeded despite inverted lighting (the board is "
+                    "brighter than its surroundings) — the colour/geometry "
+                    "fallbacks handled it."
                 )
 
             if rejection is not None:

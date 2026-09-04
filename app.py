@@ -1725,8 +1725,43 @@ def _live_stream_opencv(bridge: Pipeline, detector, settings: Settings, store) -
     """
     running = st.session_state.get("live_running", False)
 
+    source_mode = st.radio(
+        "Camera source",
+        ["Laptop camera", "Phone camera (network stream)"],
+        horizontal=True,
+        key="live_source_mode",
+        help="The phone runs an IP-camera app and streams over the same Wi-Fi "
+             "network; this page opens the stream URL directly, so no virtual "
+             "webcam driver is needed.",
+    )
+    phone_mode = source_mode.startswith("Phone")
+    phone_url = ""
+    if phone_mode:
+        left, right = st.columns([3, 1])
+        with left:
+            phone_url = st.text_input(
+                "Phone stream URL",
+                value="http://192.168.1.100:8080/video",
+                key="live_phone_url",
+                help="IP Webcam (Android): http://<phone-ip>:8080/video  ·  "
+                     "DroidCam IP mode: http://<phone-ip>:4747/video",
+            )
+        with right:
+            st.write("")
+            if st.button("Test connection", key="live_phone_test"):
+                if live.probe_stream(phone_url.strip()):
+                    st.success("Phone stream is reachable.", icon="✅")
+                else:
+                    st.error(
+                        "Could not read a frame. Check the URL, that both "
+                        "devices are on the same network, that the phone's "
+                        "stream server is running, and that Windows Firewall "
+                        "is not blocking this app.",
+                        icon="⛔",
+                    )
+
     cameras = _camera_list()
-    if not cameras and not running:
+    if not phone_mode and not cameras and not running:
         st.warning(
             "No camera could be opened from the machine running this interface. "
             "Continuous mode captures here in Python, not in the browser, so it "
@@ -1757,17 +1792,25 @@ def _live_stream_opencv(bridge: Pipeline, detector, settings: Settings, store) -
 
     controls = st.columns([3, 1, 1])
     with controls[0]:
-        camera_index = st.selectbox(
-            "Camera", cameras or [0],
-            format_func=lambda i: f"Camera {i}",
-            disabled=running or not cameras,
-            key="live_camera_index",
-        )
+        if phone_mode:
+            camera_index = 0
+            if phone_url.strip():
+                st.caption(f"Source: phone stream — {phone_url.strip()}")
+            else:
+                st.caption("Enter the phone stream URL above to enable it.")
+        else:
+            camera_index = st.selectbox(
+                "Camera", cameras or [0],
+                format_func=lambda i: f"Camera {i}",
+                disabled=running or not cameras,
+                key="live_camera_index",
+            )
     with controls[1]:
         st.write("")
         st.write("")
         start = st.button("▶ Start", type="primary", use_container_width=True,
-                          disabled=running or not cameras)
+                          disabled=running or (not phone_mode and not cameras)
+                          or (phone_mode and not phone_url.strip()))
     with controls[2]:
         st.write("")
         st.write("")
@@ -1803,21 +1846,34 @@ def _live_stream_opencv(bridge: Pipeline, detector, settings: Settings, store) -
     # The idle viewfinder gives way to the results of a finished session —
     # otherwise the page would keep re-running underneath them while they are
     # being read. Pressing Start clears the recording and it comes back.
-    previewing = bool(cameras) and not running and preview_on and not has_recording
+    source_ready = bool(phone_url.strip()) if phone_mode else bool(cameras)
+    previewing = source_ready and not running and preview_on and not has_recording
 
     if running or previewing:
         capture = st.session_state.get("live_capture")
         if capture is None:
-            capture = live.open_camera(int(camera_index))
+            capture = (
+                live.open_stream(phone_url.strip())
+                if phone_mode
+                else live.open_camera(int(camera_index))
+            )
             st.session_state["live_capture"] = capture
         if capture is None:
             st.session_state["live_running"] = False
-            st.error(
-                "The camera could not be opened. It is most likely held by "
-                "another program — Snapshot mode in this or another browser tab "
-                "keeps it open. Close those and try again.",
-                icon="⛔",
-            )
+            if phone_mode:
+                st.error(
+                    "The phone stream could not be opened. Check the URL, that "
+                    "both devices are on the same network, and that the phone's "
+                    "IP-camera app is running.",
+                    icon="⛔",
+                )
+            else:
+                st.error(
+                    "The camera could not be opened. It is most likely held by "
+                    "another program — Snapshot mode in this or another browser tab "
+                    "keeps it open. Close those and try again.",
+                    icon="⛔",
+                )
             return
 
         chip_class = "pcb-chip pcb-chip--ok" if running else "pcb-chip"

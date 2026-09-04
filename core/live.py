@@ -250,6 +250,59 @@ def open_camera(
     return None
 
 
+def open_stream(
+    url: str,
+    width: int | None = None,
+    height: int | None = None,
+) -> cv2.VideoCapture | None:
+    """
+    Open a network camera stream — a phone over Wi-Fi — and return a handle.
+
+    The phone runs an IP-camera app that serves an MJPEG/RTSP stream, and
+    OpenCV can open such URLs directly, so no virtual webcam driver is needed.
+    The stream must deliver one real frame, else ``None`` is returned (wrong
+    address, app not started, firewall, different network...).
+
+    Args:
+        url: the stream URL — e.g. IP Webcam's ``http://<phone-ip>:8080/video``
+            or DroidCam IP mode's ``http://<phone-ip>:4747/video``.
+        width / height: optional best-effort requests; many streams ignore them.
+
+    Returns:
+        An open ``VideoCapture``, or ``None`` when nothing can be read.
+    """
+    _silence_opencv()
+    if not url or not isinstance(url, str):
+        return None
+    capture = None
+    try:
+        capture = cv2.VideoCapture(url)
+        if capture.isOpened() and _read_a_frame(capture):
+            if width:
+                capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+            if height:
+                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+            try:
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:                                # noqa: BLE001
+                pass
+            return capture
+    except Exception:                                        # noqa: BLE001
+        pass
+    if capture is not None:
+        capture.release()
+    return None
+
+
+def probe_stream(url: str) -> bool:
+    """True when ``url`` delivers at least one frame — for a Test button."""
+    capture = open_stream(url)
+    if capture is None:
+        return False
+    capture.release()
+    return True
+
+
 def close_camera(capture: cv2.VideoCapture | None) -> None:
     """Release a camera handle, tolerating one that is already released."""
     if capture is None:
@@ -388,14 +441,23 @@ def capture_chunk(
     frames = 0
     last_frame: np.ndarray | None = None
     error: str | None = None
+    missed = 0
 
     while time.time() < deadline:
         started = time.time()
 
         ok, frame = capture.read()
         if not ok or frame is None:
-            error = "The camera stopped delivering frames."
-            break
+            # Network streams — a phone over ADB — drop the odd frame or stall
+            # briefly while the server catches up; that is not the camera
+            # stopping. Only a run of consecutive failures is.
+            missed += 1
+            if missed >= _READ_ATTEMPTS:
+                error = "The camera stopped delivering frames."
+                break
+            time.sleep(0.12)
+            continue
+        missed = 0
 
         frames += 1
         last_frame = frame
