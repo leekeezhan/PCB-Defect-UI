@@ -32,7 +32,8 @@ import streamlit as st
 from core.analysis import DEFAULT_CRITICAL_CLASSES, DEFAULT_SEVERITY, InspectionCriteria
 from core.detector import discover_weights, is_pretrained_stock, read_class_names_from_yaml
 from core.pipeline_bridge import MODE_MODULE, MODE_NOTEBOOK
-from core.storage import DEFAULT_SQLITE_NAME, DEFAULT_TABLE, STORE_NONE, STORE_SQLITE, STORE_SUPABASE
+from core.storage import (DEFAULT_BUCKETS, DEFAULT_SQLITE_NAME, DEFAULT_TABLE,
+                          STORE_NONE, STORE_SQLITE, STORE_SUPABASE)
 from core.workspace import ENV_WORKSPACE, workspace_root
 
 _MANUAL_ENTRY = "Enter a path manually…"
@@ -88,6 +89,8 @@ class Settings:
     supabase_url: str = ""
     supabase_key: str = ""
     supabase_table: str = DEFAULT_TABLE
+    supabase_buckets: dict = field(default_factory=lambda: dict(DEFAULT_BUCKETS))
+    supabase_images: bool = False
 
     class_names: tuple[str, ...] = field(default_factory=tuple)
 
@@ -632,6 +635,8 @@ def _history_section(root: Path | None) -> dict[str, Any]:
         "supabase_url": "",
         "supabase_key": "",
         "supabase_table": DEFAULT_TABLE,
+        "supabase_buckets": dict(DEFAULT_BUCKETS),
+        "supabase_images": False,
     }
 
     if kind == STORE_SQLITE:
@@ -654,6 +659,39 @@ def _history_section(root: Path | None) -> dict[str, Any]:
         settings["supabase_table"] = st.text_input(
             "Table", value=DEFAULT_TABLE,
         ).strip() or DEFAULT_TABLE
-        st.caption("Run `docs/supabase_schema.sql` in the Supabase SQL editor first.")
+        settings["supabase_images"] = st.checkbox(
+            "Also store the pictures", value=False,
+            help="Uploads four JPEGs per board — the operator's input, "
+                 "Module 1's output, Module 2's output and the annotated "
+                 "result — and shows them on the History page. Leave this "
+                 "off for large batch runs: it is four uploads per board, "
+                 "so a 50-image batch becomes 200 network round trips.",
+        )
+        if settings["supabase_images"]:
+            # One bucket per pipeline stage, matching the names the rest of the
+            # team already uses in the shared project. Module 1 and Module 2
+            # outputs share the "processed" bucket.
+            uploads = st.text_input(
+                "Bucket — operator input", value=DEFAULT_BUCKETS["original"],
+            ).strip() or DEFAULT_BUCKETS["original"]
+            processed = st.text_input(
+                "Bucket — Module 1 / 2 output", value=DEFAULT_BUCKETS["preprocessed"],
+            ).strip() or DEFAULT_BUCKETS["preprocessed"]
+            annotated = st.text_input(
+                "Bucket — annotated result", value=DEFAULT_BUCKETS["annotated"],
+            ).strip() or DEFAULT_BUCKETS["annotated"]
+            settings["supabase_buckets"] = {
+                "original": uploads,
+                "preprocessed": processed,
+                "aligned": processed,
+                "annotated": annotated,
+            }
+            st.caption(
+                "Run `docs/supabase_schema.sql` **and** "
+                "`docs/supabase_images.sql` in the Supabase SQL editor first — "
+                "a bucket with no policy refuses every upload from the anon key."
+            )
+        else:
+            st.caption("Run `docs/supabase_schema.sql` in the Supabase SQL editor first.")
 
     return settings

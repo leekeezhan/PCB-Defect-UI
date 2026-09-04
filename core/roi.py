@@ -86,6 +86,89 @@ def find_pcb_regions(
     return boxes[:max_boards]
 
 
+#: How much brighter than its background the board must be before
+#: :func:`board_polarity_ok` calls the case inverted. A deadband, not a
+#: hair-trigger: measured margins are about -18 to -27 for boards on a light
+#: surface (Module 2 works) and +120 for a lit screen on a dark bench (it does
+#: not), but a mixed-lighting frame can sit near +18, and with ordinary sensor
+#: noise a threshold inside that band flips from frame to frame — which would
+#: make this guard itself a source of the twisting it exists to prevent.
+POLARITY_MARGIN = 25.0
+
+
+def board_polarity_ok(
+    img: np.ndarray, min_outside_frac: float = 0.05
+) -> tuple[bool, str | None]:
+    """
+    Check the assumption Module 2's corner finder is built on.
+
+    ``image_pipeline.board_corners_threshold`` separates the board from the
+    background with ``THRESH_BINARY_INV + OTSU``, i.e. it takes the DARK side
+    of the split as the board. That holds for the dataset the system was built
+    around — a board photographed on a white surface — but it inverts when the
+    board is the bright thing in the frame, such as a lit screen or a
+    strongly-lit board on a dark bench. Module 2 then traces the dark
+    *background* instead, and either finds no four corners at all or, worse,
+    finds four corners of the wrong shape and warps the frame around them. On
+    a live stream that lands differently on nearly every frame, so the picture
+    appears to twist and jump continuously.
+
+    This is a cheap pre-flight test of that assumption, so the caller can skip
+    an alignment whose output cannot be trusted rather than showing the result
+    of one.
+
+    The board is located with a brightness floor (unlike :func:`_pcb_mask`,
+    which thresholds saturation alone — in HSV a near-black pixel has an
+    unstable, often high, saturation, so on a dark background that mask
+    swallows the whole frame).
+
+    Args:
+        img: BGR frame Module 2 is about to be given.
+        min_outside_frac: when less of the frame than this lies outside the
+            board, there is no meaningful background to compare against and
+            the assumption is left alone — the board-fills-the-frame case,
+            which is exactly the dataset Module 2 works correctly on.
+
+    Returns:
+        ``(True, None)`` when alignment is worth attempting, otherwise
+        ``(False, reason)`` naming the measurement that failed.
+    """
+    height, width = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    sat, val = hsv[:, :, 1], hsv[:, :, 2]
+
+    mask = (((sat > SAT_THRESHOLD) & (val > 40)).astype(np.uint8)) * 255
+    k = max(3, int(round(min(height, width) * 0.02)) | 1)
+    element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, element)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, element)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return True, None                      # nothing located — let Module 2 try
+
+    largest = max(contours, key=cv2.contourArea)
+    inside = np.zeros((height, width), np.uint8)
+    cv2.drawContours(inside, [largest], -1, 255, -1)
+    inside = inside > 0
+    outside = ~inside
+
+    if outside.sum() < min_outside_frac * height * width:
+        return True, None                      # board fills the frame
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    board_mean = float(gray[inside].mean())
+    background_mean = float(gray[outside].mean())
+    if board_mean <= background_mean + POLARITY_MARGIN:
+        return True, None
+
+    return False, (
+        f"the board is much brighter than its surroundings (board "
+        f"{board_mean:.0f} vs background {background_mean:.0f}), which inverts "
+        "the dark-board assumption Module 2's corner finder relies on"
+    )
+
+
 def crop_with_padding(
     img: np.ndarray, box: tuple[int, int, int, int], pad: int = 6
 ) -> np.ndarray:

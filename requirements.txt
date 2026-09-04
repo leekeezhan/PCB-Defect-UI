@@ -17,6 +17,12 @@ opencv-python>=4.8      # image decode/encode and annotation, plus the camera
 numpy>=1.24
 pandas>=2.0
 reportlab>=4.0          # PDF inspection reports
+streamlit-webrtc>=0.77  # Streams the camera to the Live page over WebRTC, so
+                        # the browser decodes the picture itself instead of
+                        # this app pushing one encoded frame at a time down
+                        # the websocket. Needs streamlit>=1.51. If it is not
+                        # installed the Live page falls back to server-side
+                        # OpenCV capture, which works but is not as smooth.
 requests>=2.28          # client for both upstream services (a Streamlit
                         # dependency already, listed here so the need is explicit)
 
@@ -41,7 +47,7 @@ requests>=2.28          # client for both upstream services (a Streamlit
 # nbformat>=5.9
 
 # --- Optional: shared inspection history ---------------------------------- #
-# Only needed for the Supabase history store. The default store is SQLite, which
-# ships with Python and needs nothing installed. Uncomment to enable Supabase,
-# and run docs/supabase_schema.sql in the Supabase SQL editor first.
-# supabase>=2.4
+# Needed for the Supabase history store. The default store is SQLite, which
+# ships with Python and needs nothing installed. Run docs/supabase_schema.sql
+# in the Supabase SQL editor before selecting Supabase in the sidebar.
+supabase>=2.4

@@ -34,7 +34,8 @@ import numpy as np
 from .analysis import InspectionCriteria, InspectionSummary, rejected, summarise
 from .detector import DefectDetector, Detection, DetectionResult
 from .pipeline_bridge import PipelineBridge, StageResult  # noqa: F401  (documents the contract)
-from .roi import crop_with_padding, find_pcb_regions
+from . import pcb_check
+from .roi import board_polarity_ok, crop_with_padding, find_pcb_regions
 
 #: Either pipeline adapter — the HTTP client or the local bridge.
 Pipeline = Any
@@ -624,6 +625,28 @@ def stage_frame(
                                    board_boxes=boxes)
     result = bridge.run(frame, mode=mode,
                         do_preprocess=do_preprocess, do_align=do_align)
+
+    # The local adapter refuses the alignment itself (see PipelineBridge.run),
+    # but the remote service has no such guard, so a suspect alignment is
+    # discarded here as well — otherwise a live stream of a lit board over a
+    # dark bench twists and jumps on every frame. Same test either way.
+    if result.aligned is not None:
+        source = result.preprocessed if result.preprocessed is not None else result.original
+        if source is not None:
+            polarity_ok, reason = board_polarity_ok(source)
+            if not polarity_ok:
+                result.notes.append(
+                    f"Module 2's alignment was discarded because {reason}. "
+                    "The frame was scaled to the detector's expected size instead."
+                )
+                target = 1280
+                fh, fw = source.shape[:2]
+                scale = target / max(fw, fh)
+                result.aligned = None
+                result.final = cv2.resize(
+                    source, (int(round(fw * scale)), int(round(fh * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
     # Board rectangles power the detection anchoring (marks follow the moving
     # boards). The remote adapter gets them from the service response.
     if hasattr(bridge, "find_boards") and not result.board_boxes:
@@ -731,20 +754,29 @@ def process_video(
                 stages = stage_frame(bridge, frame, mode=mode,
                                      do_preprocess=do_preprocess,
                                      do_align=do_align)
-                if stages.pcb_valid is False:
-                    # Student 1's validate_pcb_image() rejected this frame
-                    # before Modules 1-3 did any work on it — see
-                    # StageResult.pcb_valid / core.analysis.rejected. Only
-                    # reached when stage_frame() fell back to bridge.run():
-                    # a frame stage_frame() already resolved to 2+ real boards
-                    # never goes through this single-board check at all.
+                if len(stages.board_boxes) > 1:
+                    # A genuine multi-board conveyor frame — find_boards()
+                    # already gives a stronger answer than either single-board
+                    # PCB check is designed to provide, so neither one runs.
+                    pcb_valid, pcb_message = True, None
+                else:
+                    # Student 1's own check (StageResult.pcb_valid) plus this
+                    # repository's independent second opinion (hue
+                    # concentration + texture) — either one rejecting is
+                    # enough. Only reached when stage_frame() fell back to
+                    # bridge.run(): a frame stage_frame() already resolved to
+                    # 2+ real boards never goes through this branch at all.
+                    pcb_valid, pcb_message = pcb_check.evaluate(
+                        stages.pcb_valid, stages.pcb_message, stages.original
+                    )
+                if pcb_valid is False:
                     image_shape = stages.final.shape[:2] if stages.final is not None else (0, 0)
                     detection_result = DetectionResult(
                         detections=[], inference_ms=0.0, image_shape=image_shape,
                         model_name=detector.model_name, error=None,
                     )
                     summary = rejected(
-                        stages.pcb_message or "Frame does not appear to contain a PCB.",
+                        pcb_message or "Frame does not appear to contain a PCB.",
                         image_shape=image_shape,
                     )
                     raw_result = detection_result
@@ -990,6 +1022,56 @@ def _find_ffmpeg() -> str | None:
 
     import shutil
     return shutil.which("ffmpeg")
+
+
+def encode_frames(frames: list[np.ndarray], fps: float = 10.0) -> bytes | None:
+    """
+    Encode captured frames into a video file and return it as bytes.
+
+    The Live page records what the camera saw while the operator was streaming;
+    once they stop, that recording is inspected board by board with
+    :func:`scan_boards`, which reads a video. This turns the one into the
+    other, so the live recording travels exactly the same path an uploaded clip
+    does rather than needing a second, parallel implementation.
+
+    Every frame is written at the size of the first one, matching the rest of
+    this module — a camera can change resolution mid-session and
+    ``VideoWriter`` cannot.
+
+    Args:
+        frames: BGR arrays in capture order.
+        fps: frame rate to stamp on the output, normally the measured
+            inspection rate of the session that produced the frames.
+
+    Returns:
+        The encoded video, or ``None`` when there is nothing to encode or no
+        codec on this machine could be opened.
+    """
+    usable = [frame for frame in frames if frame is not None]
+    if not usable:
+        return None
+
+    height, width = usable[0].shape[:2]
+    size = (width, height)
+    output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    writer = _open_writer(output_path, max(1.0, float(fps)), size)
+    if writer is None:
+        _remove(output_path)
+        return None
+
+    try:
+        for frame in usable:
+            _write_frame(writer, frame, size)
+    finally:
+        writer.release()
+
+    try:
+        with open(output_path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        data = None
+    _remove(output_path)
+    return data or None
 
 
 def _write_temp(data: bytes, suffix: str = ".mp4") -> str:

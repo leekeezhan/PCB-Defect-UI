@@ -180,7 +180,10 @@ def class_bar_chart(class_counts: dict[str, int], caption: str = "") -> None:
         st.caption(caption)
 
 
-def download_row(items: Iterable[tuple[str, bytes | None, str, str]]) -> None:
+def download_row(
+    items: Iterable[tuple[str, bytes | None, str, str]],
+    key_prefix: str = "",
+) -> None:
     """
     Lay a set of download buttons out in a single row.
 
@@ -188,16 +191,23 @@ def download_row(items: Iterable[tuple[str, bytes | None, str, str]]) -> None:
         items: ``(label, data, file_name, mime)`` tuples. Entries whose ``data``
             is ``None`` render as a disabled button, so the row keeps its shape
             when, for example, PDF generation is unavailable.
+        key_prefix: namespace for the element keys. Each button's key is
+            derived from its file name, so a row rendered by a tool that
+            appears on more than one page — and every page of this app is
+            rendered on every script run — needs a prefix to keep those keys
+            unique. Without one, Streamlit raises
+            ``StreamlitDuplicateElementKey``.
     """
     items = [item for item in items]
     if not items:
         return
+    prefix = f"{key_prefix}_" if key_prefix else ""
     columns = st.columns(len(items))
     for column, (label, data, file_name, mime) in zip(columns, items):
         with column:
             if data is None:
                 st.button(label, disabled=True, use_container_width=True,
-                          key=f"disabled_{file_name}")
+                          key=f"{prefix}disabled_{file_name}")
             else:
                 st.download_button(
                     label,
@@ -205,5 +215,5 @@ def download_row(items: Iterable[tuple[str, bytes | None, str, str]]) -> None:
                     file_name=file_name,
                     mime=mime,
                     use_container_width=True,
-                    key=f"download_{file_name}",
+                    key=f"{prefix}download_{file_name}",
                 )

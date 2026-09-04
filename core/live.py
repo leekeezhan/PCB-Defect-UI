@@ -38,6 +38,7 @@ import numpy as np
 from .analysis import InspectionCriteria, InspectionSummary, rejected, summarise
 from .detector import DetectionResult
 from .pipeline_bridge import PipelineBridge  # noqa: F401  (documents the contract)
+from . import pcb_check
 from .video import BoardAnchoredConsensus, BoardRecord, stage_frame
 
 #: Either pipeline adapter — the HTTP client or the local bridge.
@@ -344,6 +345,70 @@ class ChunkResult:
     error: str | None = None
 
 
+@dataclass
+class CaptureResult:
+    """What one chunk of plain recording produced."""
+
+    frames: int
+    last_frame: np.ndarray | None = None
+    error: str | None = None
+
+
+def capture_chunk(
+    capture: cv2.VideoCapture,
+    seconds: float = 2.0,
+    max_fps: float = 12.0,
+    on_frame: Callable[[np.ndarray], None] | None = None,
+) -> CaptureResult:
+    """
+    Record from the camera for a bounded slice of time, without inspecting.
+
+    This is the viewfinder half of the Live page. Detection takes seconds per
+    frame, so a preview drawn from inspected frames lags far behind what the
+    camera is actually pointing at — useless for aiming it. Capturing on its
+    own runs at camera speed, so the operator sees the real scene while it is
+    being recorded; the whole recording is inspected board by board once they
+    stop.
+
+    Args:
+        capture: an open camera handle.
+        seconds: how long this chunk may run before returning control to
+            Streamlit, so the Stop button stays responsive.
+        max_fps: ceiling on the preview/record rate. The limit is the browser
+            round trip for each previewed frame, not the camera.
+        on_frame: called with every frame as it arrives, for display and
+            recording.
+
+    Returns:
+        A :class:`CaptureResult`. A camera that stops delivering frames is
+        reported through ``error`` rather than raising.
+    """
+    deadline = time.time() + max(0.2, float(seconds))
+    interval = 1.0 / max(1.0, float(max_fps))
+    frames = 0
+    last_frame: np.ndarray | None = None
+    error: str | None = None
+
+    while time.time() < deadline:
+        started = time.time()
+
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            error = "The camera stopped delivering frames."
+            break
+
+        frames += 1
+        last_frame = frame
+        if on_frame is not None:
+            on_frame(frame)
+
+        remaining = interval - (time.time() - started)
+        if remaining > 0:
+            time.sleep(min(remaining, max(0.0, deadline - time.time())))
+
+    return CaptureResult(frames, last_frame, error)
+
+
 # --------------------------------------------------------------------------- #
 # The chunked capture loop
 # --------------------------------------------------------------------------- #
@@ -366,6 +431,7 @@ def run_chunk(
     consensus: BoardAnchoredConsensus | None = None,
     on_frame: Callable[[np.ndarray, InspectionSummary], None] | None = None,
     on_boards: Callable[[list[BoardRecord]], None] | None = None,
+    on_capture: Callable[[np.ndarray], None] | None = None,
 ) -> ChunkResult:
     """
     Capture and inspect frames for a bounded slice of time.
@@ -399,6 +465,9 @@ def run_chunk(
             frame, so the interface can update its placeholders mid-chunk.
         on_boards: called with the per-board records of each frame, so the
             interface can show one result per board.
+        on_capture: called with every frame as it comes off the camera, before
+            any processing. The Live page uses it to record the session so the
+            whole run can be inspected board by board once it is stopped.
 
     Returns:
         A :class:`ChunkResult`. A camera that stops delivering frames is
@@ -425,22 +494,36 @@ def run_chunk(
             error = "The camera stopped delivering frames."
             break
 
+        if on_capture is not None:
+            on_capture(frame)
+
         stages = stage_frame(bridge, frame, mode=mode,
                              do_preprocess=do_preprocess, do_align=do_align)
-        if stages.pcb_valid is False:
-            # Student 1's validate_pcb_image() rejected this frame (camera
-            # pointed at the bench, a hand, nothing at all, ...) before
-            # Modules 1-3 did any work on it — see StageResult.pcb_valid /
-            # core.analysis.rejected. Only reached when stage_frame() fell
-            # back to bridge.run(): a frame stage_frame() already resolved to
-            # 2+ real boards never goes through this single-board check.
+        if len(stages.board_boxes) > 1:
+            # A genuine multi-board conveyor frame — find_boards() already
+            # gives a stronger answer than either single-board PCB check is
+            # designed to provide, so neither one runs.
+            pcb_valid, pcb_message = True, None
+        else:
+            # Student 1's own check (StageResult.pcb_valid) plus this
+            # repository's independent second opinion (hue concentration +
+            # texture) — either one rejecting is enough. Only reached when
+            # stage_frame() fell back to bridge.run(): a frame stage_frame()
+            # already resolved to 2+ real boards never goes through this
+            # branch at all.
+            pcb_valid, pcb_message = pcb_check.evaluate(
+                stages.pcb_valid, stages.pcb_message, stages.original
+            )
+        if pcb_valid is False:
+            # Rejected before Modules 1-3 did any work on it (camera pointed
+            # at the bench, a hand, nothing at all, ...).
             image_shape = stages.final.shape[:2] if stages.final is not None else (0, 0)
             detection_result = DetectionResult(
                 detections=[], inference_ms=0.0, image_shape=image_shape,
                 model_name=detector.model_name, error=None,
             )
             summary = rejected(
-                stages.pcb_message or "Frame does not appear to contain a PCB.",
+                pcb_message or "Frame does not appear to contain a PCB.",
                 image_shape=image_shape,
             )
             raw_result = detection_result

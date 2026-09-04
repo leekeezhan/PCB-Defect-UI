@@ -59,10 +59,25 @@ _APP_DIR = Path(__file__).resolve().parent
 if str(_APP_DIR) not in sys.path:
     sys.path.insert(0, str(_APP_DIR))
 
+import time
+
+import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core import analysis, live, report, roi, storage, video, viz
+from core import analysis, live, pcb_check, report, roi, storage, video, viz
+
+# streamlit-webrtc streams the camera over WebRTC: the browser decodes the
+# picture natively instead of this script pushing one encoded frame at a time
+# down the websocket, and the frames still reach Python for recording. It is
+# optional — without it the Live page falls back to the OpenCV capture loop,
+# which works everywhere but cannot be as smooth.
+try:
+    from streamlit_webrtc import WebRtcMode, webrtc_streamer
+    WEBRTC_AVAILABLE = True
+except ImportError:                                      # noqa: BLE001
+    WEBRTC_AVAILABLE = False
 from core.analysis import BatchSummary, InspectionSummary
 from core.detector import DefectDetector, DetectionResult, filter_by_class
 from core.pipeline_bridge import (
@@ -86,6 +101,29 @@ from ui.sidebar import SOURCE_REMOTE, Settings, render_sidebar
 from ui.theme import inject_css, render_header, section
 
 APP_TITLE = "PCB Defect Inspection System"
+
+#: Hard cap on how many camera frames one live session records for the
+#: board-by-board pass that runs on Stop. At the default 3 inspections a
+#: second this is about 5 minutes of footage; the frames are JPEG-encoded
+#: (roughly 100 KB each), so the ceiling is on the order of 90 MB rather
+#: than the 1.6 GB the same frames would occupy raw.
+LIVE_RECORD_MAX_FRAMES = 900
+
+#: Width the live viewfinder is scaled to before being sent to the browser,
+#: and the ceiling on how many of those frames a second are sent. The limit is
+#: the round trip per frame, not the camera; the full-resolution frame is what
+#: gets recorded either way.
+#:
+#: The viewfinder cannot be as smooth as Snapshot mode's, and the reason is
+#: structural rather than a setting: ``st.camera_input`` is a *browser* widget,
+#: so its picture never leaves the browser and is drawn natively at the
+#: camera's own rate. This viewfinder is captured by OpenCV in Python here,
+#: then every frame is encoded and pushed over the websocket for the browser to
+#: swap into an <img>. Encoding each frame as JPEG rather than letting
+#: Streamlit turn the array into a PNG is what makes that rate achievable at
+#: all (measured 1.9 ms / 218 KB against 41 ms / 856 KB for a 720px frame).
+LIVE_PREVIEW_WIDTH = 720
+LIVE_PREVIEW_FPS = 15.0
 
 #: Either Modules 1 & 2 adapter — ``core.pipeline_remote.RemotePipeline``
 #: (the default) or ``core.pipeline_bridge.PipelineBridge``. They expose the
@@ -156,10 +194,25 @@ def get_remote_detector(
 
 
 @st.cache_resource(show_spinner=False)
-def get_store(kind: str, sqlite_path: str, url: str, key: str, table: str):
-    """Open the configured inspection-history store once per configuration."""
+def get_store(kind: str, sqlite_path: str, url: str, key: str, table: str,
+              bucket_original: str = "", bucket_processed: str = "",
+              bucket_annotated: str = ""):
+    """
+    Open the configured inspection-history store once per configuration.
+
+    The buckets arrive as three separate strings rather than the mapping the
+    store takes, because ``st.cache_resource`` hashes its arguments and a dict
+    is not hashable.
+    """
+    buckets = {
+        "original": bucket_original,
+        "preprocessed": bucket_processed,
+        "aligned": bucket_processed,
+        "annotated": bucket_annotated,
+    }
     return storage.create_store(
-        kind, sqlite_path=sqlite_path, supabase_url=url, supabase_key=key, table=table
+        kind, sqlite_path=sqlite_path, supabase_url=url, supabase_key=key,
+        table=table, buckets={k: v for k, v in buckets.items() if v},
     )
 
 
@@ -191,6 +244,9 @@ def _store_for(settings: Settings):
         settings.supabase_url,
         settings.supabase_key,
         settings.supabase_table,
+        settings.supabase_buckets.get("original", ""),
+        settings.supabase_buckets.get("preprocessed", ""),
+        settings.supabase_buckets.get("annotated", ""),
     )
 
 
@@ -225,9 +281,16 @@ def inspect(image, bridge: Pipeline, detector, settings: Settings, do_align: boo
         do_align=settings.do_align if do_align is None else do_align,
     )
 
-    if stages.pcb_valid is False:
-        # Student 1's validate_pcb_image() rejected the upload before Modules
-        # 1-3 ran any work on it — see StageResult.pcb_valid. Reported as an
+    # Student 1's validate_pcb_image() alone (StageResult.pcb_valid) only
+    # checks for a plausibly-sized, plausibly-shaped saturated blob — this
+    # repository's own pcb_check.evaluate() adds a second, independent
+    # opinion (dominant-hue concentration + edge/texture density) on top of
+    # it, run on the ORIGINAL upload. Either one rejecting is enough.
+    pcb_valid, pcb_message = pcb_check.evaluate(
+        stages.pcb_valid, stages.pcb_message, stages.original
+    )
+    if pcb_valid is False:
+        # Rejected before Modules 1-3 ran any work on it. Reported as an
         # outright FAIL via analysis.rejected() rather than being sent to the
         # detector, so an arbitrary non-PCB photo can no longer report PASS
         # simply because the detector found nothing it recognises.
@@ -237,7 +300,7 @@ def inspect(image, bridge: Pipeline, detector, settings: Settings, do_align: boo
             model_name=detector.model_name, error=None,
         )
         summary = analysis.rejected(
-            stages.pcb_message or "Uploaded image does not appear to contain a PCB.",
+            pcb_message or "Uploaded image does not appear to contain a PCB.",
             image_shape=image_shape,
         )
         annotated = stages.final
@@ -262,7 +325,8 @@ def inspect(image, bridge: Pipeline, detector, settings: Settings, do_align: boo
     return stages, detection_result, summary, annotated
 
 
-def _log(store, summaries, sources: list[str], mode: str, model: str) -> int:
+def _log(store, summaries, sources: list[str], mode: str, model: str,
+         images: list[dict[str, Any]] | None = None) -> int:
     """
     Persist inspection outcomes, never letting a storage failure break the page.
 
@@ -272,6 +336,10 @@ def _log(store, summaries, sources: list[str], mode: str, model: str) -> int:
         sources: matching identifiers — file names, frame labels, camera labels.
         mode: which page produced them.
         model: the detector that produced the detections.
+        images: optional ``{stage: BGR array}`` per unit, in the same order as
+            ``summaries``. Uploaded to the store when it can hold pictures and
+            the operator asked for it; the resulting URLs go on the row. Stores
+            without picture support ignore this entirely.
 
     Returns:
         How many rows were written. Zero when history is switched off.
@@ -283,9 +351,52 @@ def _log(store, summaries, sources: list[str], mode: str, model: str) -> int:
             InspectionRecord.from_summary(summary, source=source, mode=mode, model=model)
             for summary, source in zip(summaries, sources)
         ]
+        if images and hasattr(store, "upload_images"):
+            _attach_images(store, records, images)
         return store.log_many(records)
     except Exception:                                        # noqa: BLE001
         return 0
+
+
+def _stage_images(settings: Settings, stages, annotated) -> dict[str, Any]:
+    """
+    The pictures worth keeping for one board, or ``{}`` when storing is off.
+
+    Named for the pipeline stage each one came from, matching the columns in
+    docs/supabase_images.sql: what the operator supplied, Module 1's output,
+    Module 2's output, and the annotated detection result.
+    """
+    if not getattr(settings, "supabase_images", False):
+        return {}
+    return {
+        "original": getattr(stages, "original", None),
+        "preprocessed": getattr(stages, "preprocessed", None),
+        "aligned": getattr(stages, "aligned", None),
+        "annotated": annotated,
+    }
+
+
+def _attach_images(store, records: list[InspectionRecord], images: list[dict[str, Any]]) -> None:
+    """
+    Upload each unit's stage pictures and record their URLs.
+
+    A failed upload leaves that row's URL empty rather than costing the row: the
+    inspection result is the thing worth keeping, and the store reports the
+    reason through its own ``last_error``.
+    """
+    for record, stages in zip(records, images):
+        if not stages:
+            continue
+        encoded = {
+            stage: viz.encode_jpeg(image, quality=85)
+            for stage, image in stages.items()
+            if image is not None
+        }
+        encoded = {stage: data for stage, data in encoded.items() if data}
+        if not encoded:
+            continue
+        for stage, url in store.upload_images(encoded, name_hint=record.source).items():
+            setattr(record, f"image_{stage}", url)
 
 
 def _build_pdf(builder, *args, **kwargs) -> tuple[bytes | None, str | None]:
@@ -349,7 +460,8 @@ def page_single(bridge: Pipeline, detector, settings: Settings, store) -> None:
             stages, detection_result, summary, annotated = inspect(
                 image, bridge, detector, settings
             )
-        logged = _log(store, [summary], [source_name], "single", detector.model_name)
+        logged = _log(store, [summary], [source_name], "single", detector.model_name,
+                      images=[_stage_images(settings, stages, annotated)])
         st.session_state["single_result"] = {
             "name": source_name,
             "stages": stages,
@@ -561,6 +673,7 @@ def _run_batch(paths, uploads, run_name, bridge, detector, settings, store) -> N
     rows: list[dict[str, Any]] = []
     gallery: list[tuple[str, Any]] = []
     skipped: list[str] = []
+    batch_images: list[dict[str, Any]] = []
 
     for index, (name, item) in enumerate(items, start=1):
         image = read_image(item) if isinstance(item, Path) else decode_image(item.getvalue())
@@ -569,9 +682,10 @@ def _run_batch(paths, uploads, run_name, bridge, detector, settings, store) -> N
             progress.progress(index / len(items), text=f"Skipped {name} (unreadable)")
             continue
 
-        _, detection_result, summary, annotated = inspect(image, bridge, detector, settings)
+        stages, detection_result, summary, annotated = inspect(image, bridge, detector, settings)
         summaries.append(summary)
         names.append(name)
+        batch_images.append(_stage_images(settings, stages, annotated))
         rows.append(summary.as_row(name))
 
         # Keep a handful of failures as evidence for the PDF appendix and gallery.
@@ -585,7 +699,8 @@ def _run_batch(paths, uploads, run_name, bridge, detector, settings, store) -> N
         )
 
     progress.empty()
-    logged = _log(store, summaries, names, "batch", detector.model_name)
+    logged = _log(store, summaries, names, "batch", detector.model_name,
+                  images=batch_images)
     st.session_state["batch_result"] = {
         "run_name": run_name,
         "summaries": summaries,
@@ -816,6 +931,8 @@ def _render_board_scan(
     detector,
     settings: Settings,
     store,
+    key_prefix: str = "scan",
+    history_mode: str = "video-board",
 ) -> None:
     """
     Walk the whole clip, capture every board once, and inspect each on its own.
@@ -825,6 +942,15 @@ def _render_board_scan(
     the same physical board over and over; tracking each board and capturing it
     at its most complete moment gives one clean shot per board, and each of
     those goes through Modules 1, 2 and 3 individually.
+
+    Args:
+        key_prefix: namespace for this instance's widget and session-state
+            keys. The Live page offers the same tool against an uploaded clip,
+            and two copies of it must not share one set of controls or one set
+            of results — so each call site passes its own prefix.
+        history_mode: the ``mode`` column written to the inspection history,
+            so a scan started from the Live page is distinguishable from one
+            started on the Video page.
     """
     if not video_bytes:
         st.info("Upload a video above to use this tool.", icon="🎞")
@@ -833,24 +959,24 @@ def _render_board_scan(
     left, middle, right = st.columns([2, 2, 1])
     with left:
         every_n = st.slider(
-            "Check every n-th frame", 1, 15, 3, key="scan_every_n",
+            "Check every n-th frame", 1, 15, 3, key=f"{key_prefix}_every_n",
             help="A board moves only a few pixels per frame, so testing every "
                  "frame buys nothing. Lower this only if boards travel fast.",
         )
     with middle:
         max_boards = st.slider(
-            "Maximum boards to capture", 1, 50, 20, key="scan_max_boards",
+            "Maximum boards to capture", 1, 50, 20, key=f"{key_prefix}_max_boards",
             help="Stops a long clip from producing hundreds of inspections.",
         )
     with right:
         st.write("")
         st.write("")
         run_scan = st.button("Scan video for boards", type="primary",
-                             use_container_width=True, key="scan_run")
+                             use_container_width=True, key=f"{key_prefix}_run")
 
     include_partial = st.checkbox(
         "Also inspect boards that are never completely in frame", value=False,
-        key="scan_include_partial",
+        key=f"{key_prefix}_include_partial",
         help="A board still entering when the clip ends is cut off by the edge "
              "of the picture. It is found and listed either way; inspecting one "
              "reports only the defects on the visible part, so the verdict is "
@@ -906,14 +1032,16 @@ def _render_board_scan(
             store,
             [item["summary"] for item in inspected],
             [f"{video_name}#board_{item['index']}_frame_{item['frame']}" for item in inspected],
-            "video-board",
+            history_mode,
             detector.model_name,
+            images=[_stage_images(settings, item["stages"], item["annotated"])
+                    for item in inspected],
         )
-        st.session_state["board_scan_result"] = {
+        st.session_state[f"{key_prefix}_result"] = {
             "name": video_name, "boards": results, "logged": logged, "skipped": skipped,
         }
 
-    scan = st.session_state.get("board_scan_result")
+    scan = st.session_state.get(f"{key_prefix}_result")
     if not scan:
         st.info("Select **Scan video for boards** to inspect the clip board by board.",
                 icon="🔍")
@@ -995,13 +1123,18 @@ def _render_board_scan(
     else:
         st.caption("Inspect at least one board to generate a PDF report.")
 
+    # The downloads are named after the clip they came from, not a fixed
+    # "video_boards" — this tool runs on both the Video and the Live page, and
+    # every page of the app is rendered on every script run, so two fixed names
+    # would be two Streamlit elements with the same key. Naming them after the
+    # source also tells the operator which run a saved file belongs to.
     download_row([
         ("📄 PDF stream report", pdf_bytes, f"{stem}_boards_report.pdf", "application/pdf"),
         ("🗂 All boards (ZIP)", _boards_zip(inspected, scan["name"]),
-         "video_boards.zip", "application/zip"),
+         f"{stem}_boards.zip", "application/zip"),
         ("📊 Summary (CSV)", table.to_csv(index=False).encode("utf-8-sig"),
-         "video_boards.csv", "text/csv"),
-    ])
+         f"{stem}_boards.csv", "text/csv"),
+    ], key_prefix=key_prefix)
 
     for item in boards:
         heading = (f"###### Board {item['index']} — frame {item['frame']} "
@@ -1012,7 +1145,8 @@ def _render_board_scan(
         if item["summary"] is None:
             st.caption("Not inspected — the clip never shows this board whole.")
             continue
-        _render_board_pair(item, f"board{item['index']}_frame{item['frame']}")
+        _render_board_pair(item, f"board{item['index']}_frame{item['frame']}",
+                           key_prefix=key_prefix)
 
 
 def _alignment_state(stages) -> str:
@@ -1022,8 +1156,16 @@ def _alignment_state(stages) -> str:
     return "straightened" if getattr(stages, "align_effective", True) else "rescaled only"
 
 
-def _render_board_pair(item: dict[str, Any], stem: str) -> None:
-    """Show one board's detector input and annotated result, with downloads."""
+def _render_board_pair(item: dict[str, Any], stem: str, key_prefix: str = "") -> None:
+    """
+    Show one board's detector input and annotated result, with downloads.
+
+    Args:
+        key_prefix: namespace for the download-button keys. Two call sites
+            can produce the same ``stem`` (board 1 of frame 12 exists in any
+            clip), and every page renders on every script run, so the keys
+            need separating.
+    """
     stages = item["stages"]
     state = _alignment_state(stages)
     captions = {
@@ -1044,7 +1186,7 @@ def _render_board_pair(item: dict[str, Any], stem: str) -> None:
         (f"⬇️ Detector input", viz.encode_jpeg(stages.final), f"{stem}_input.jpg", "image/jpeg"),
         (f"⬇️ Annotated", viz.encode_jpeg(item["annotated"]),
          f"{stem}_annotated.jpg", "image/jpeg"),
-    ])
+    ], key_prefix=key_prefix)
 
 
 def _boards_zip(boards: list[dict[str, Any]], video_name: str) -> bytes | None:
@@ -1173,7 +1315,8 @@ def _render_frame_inspector(
 
     for i, board in enumerate(frame_boards["boards"], start=1):
         st.markdown(f"###### Board {i}")
-        _render_board_pair(board, f"frame{frame_boards['frame_index']}_board{i}")
+        _render_board_pair(board, f"frame{frame_boards['frame_index']}_board{i}",
+                           key_prefix="frame_tool")
 
 
 def _render_video_result(stored: dict[str, Any]) -> None:
@@ -1333,8 +1476,9 @@ def page_live(bridge: Pipeline, detector, settings: Settings, store) -> None:
         horizontal=True,
         key="live_mode",
         help="Snapshot takes one photograph through the browser and inspects it "
-             "like any uploaded board. Continuous stream repeatedly captures and "
-             "inspects, reporting a running yield.",
+             "like any uploaded board. Continuous stream records from a camera "
+             "attached to this machine, showing the live view while it records, "
+             "and inspects the whole recording board by board when you stop.",
     )
 
     if capture_mode == "Snapshot":
@@ -1364,7 +1508,8 @@ def _live_snapshot(bridge: Pipeline, detector, settings: Settings, store) -> Non
     with st.spinner("Running Modules 1 → 2 → 3…"):
         stages, detection_result, summary, annotated = inspect(image, bridge, detector, settings)
 
-    logged = _log(store, [summary], ["camera snapshot"], "live", detector.model_name)
+    logged = _log(store, [summary], ["camera snapshot"], "live", detector.model_name,
+                  images=[_stage_images(settings, stages, annotated)])
     _render_single_result(
         {
             "name": "camera_snapshot.jpg",
@@ -1382,11 +1527,185 @@ def _live_snapshot(bridge: Pipeline, detector, settings: Settings, store) -> Non
 
 def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
     """
-    Continuous capture from a local camera.
+    Continuous capture: WebRTC when it is installed, the OpenCV loop otherwise.
 
-    The loop runs in short chunks (see ``core.live``) so the Stop button stays
-    responsive. Session state carries the camera handle and the running totals
-    between chunks.
+    Both record a session and then inspect the whole recording board by board;
+    they differ only in how the camera reaches this script, which is what
+    decides how smooth the picture is. See :func:`_live_stream_webrtc`.
+    """
+    if WEBRTC_AVAILABLE:
+        _live_stream_webrtc(bridge, detector, settings, store)
+    else:
+        st.info(
+            "Install **streamlit-webrtc** (`pip install streamlit-webrtc`) for a "
+            "smooth camera view — the browser then decodes the video itself. "
+            "Falling back to server-side capture, which works but updates the "
+            "picture frame by frame over the websocket.",
+            icon="💡",
+        )
+        _live_stream_opencv(bridge, detector, settings, store)
+
+
+def _live_stream_webrtc(bridge: Pipeline, detector, settings: Settings, store) -> None:
+    """
+    Record from the camera over WebRTC, then inspect the recording board by board.
+
+    Why this is smoother than :func:`_live_stream_opencv`: there, every frame is
+    captured by OpenCV in Python, encoded, pushed down the Streamlit websocket
+    and swapped into an ``<img>``, and the script re-runs every couple of
+    seconds to keep going — measured around 15 frames a second with a visible
+    hitch at each re-run. Here the browser sends a real video stream and plays
+    the returned one in a ``<video>`` element, decoded natively at the camera's
+    own rate, and the stream keeps running on its own thread whether or not the
+    script re-runs.
+
+    The trade-off, stated plainly: the picture is the stream that has been to
+    Python and back, so it lags behind reality by the round trip (a fraction of
+    a second on one machine). Snapshot mode's preview has no lag at all because
+    it never leaves the browser — but that also means Snapshot cannot give this
+    script a single frame until the shutter is pressed, which is why it cannot
+    be used to record.
+
+    ``video_frame_callback`` runs on the streamer's own worker thread, where
+    ``st.session_state`` must not be touched. It therefore writes into a plain
+    dictionary created once and kept in session state: the main thread and the
+    worker share that one object, and appending to a list is safe under the
+    GIL.
+    """
+    recorder = st.session_state.setdefault(
+        "live_recorder", {"frames": [], "recording": False, "started_at": None}
+    )
+
+    def video_frame_callback(frame):
+        """Runs on the streamer's thread — record, then hand the frame back."""
+        if recorder["recording"] and len(recorder["frames"]) < LIVE_RECORD_MAX_FRAMES:
+            image = frame.to_ndarray(format="bgr24")
+            ok, buffer = cv2.imencode(
+                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+            )
+            if ok:
+                recorder["frames"].append(buffer.tobytes())
+        return frame
+
+    context = webrtc_streamer(
+        key="live_webrtc",
+        mode=WebRtcMode.SENDRECV,
+        # A public STUN server so this still works when the page is opened from
+        # another machine on the network. Not needed on this machine alone.
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        media_stream_constraints={"video": True, "audio": False},
+        video_frame_callback=video_frame_callback,
+        async_processing=True,
+    )
+
+    playing = bool(context.state.playing)
+    recording = bool(recorder["recording"])
+
+    if not playing:
+        recorder["recording"] = False
+        st.caption(
+            "Select **START** above to turn the camera on, then record the "
+            "boards travelling past."
+        )
+    else:
+        st.caption(
+            "The camera is on. Select **Start recording**, let the boards pass, "
+            "then stop — the whole recording is inspected board by board."
+        )
+
+    columns = st.columns([1, 1, 2])
+    with columns[0]:
+        start = st.button("● Start recording", type="primary",
+                          use_container_width=True,
+                          disabled=not playing or recording,
+                          key="live_webrtc_start")
+    with columns[1]:
+        stop = st.button("■ Stop recording", use_container_width=True,
+                         disabled=not recording, key="live_webrtc_stop")
+
+    if start:
+        recorder["frames"] = []
+        recorder["recording"] = True
+        recorder["started_at"] = time.time()
+        st.session_state["live_recording"] = None
+        st.session_state.pop("live_rec_scan_result", None)
+        st.rerun()
+
+    if stop:
+        recorder["recording"] = False
+        _finalise_webrtc_recording(recorder)
+        st.rerun()
+
+    if recording:
+        captured = len(recorder["frames"])
+        elapsed = max(0.001, time.time() - (recorder["started_at"] or time.time()))
+        st.markdown(
+            '<div class="pcb-chips">'
+            '<span class="pcb-chip pcb-chip--ok">● RECORDING</span></div>',
+            unsafe_allow_html=True,
+        )
+        metrics = st.columns(3)
+        metrics[0].metric("Frames recorded", captured)
+        metrics[1].metric("Recording time", f"{elapsed:.0f} s")
+        metrics[2].metric("Capture rate", f"{captured / elapsed:.1f} /s")
+        st.caption(
+            "The counts above are from the moment this page last drew — the "
+            "recording itself runs continuously on its own thread. Select "
+            "**Stop recording** for the final figures."
+        )
+        if captured >= LIVE_RECORD_MAX_FRAMES:
+            recorder["recording"] = False
+            _finalise_webrtc_recording(recorder)
+            st.warning(
+                f"Recording stopped at the {LIVE_RECORD_MAX_FRAMES}-frame limit.",
+                icon="⚠️",
+            )
+            st.rerun()
+        return
+
+    if not st.session_state.get("live_recording"):
+        return
+
+    _render_live_recording_scan(bridge, detector, settings, store)
+
+
+def _finalise_webrtc_recording(recorder: dict[str, Any]) -> None:
+    """Encode the frames a WebRTC session recorded into a video."""
+    frames = recorder.get("frames") or []
+    if not frames:
+        return
+
+    decoded = []
+    for encoded in frames:
+        image = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
+        if image is not None:
+            decoded.append(image)
+
+    started_at = recorder.get("started_at")
+    elapsed = (time.time() - started_at) if started_at else 0.0
+    fps = (len(decoded) / elapsed) if elapsed > 0.5 else 15.0
+    st.session_state["live_recording"] = video.encode_frames(
+        decoded, fps=max(1.0, fps)
+    )
+    recorder["frames"] = []
+
+
+def _live_stream_opencv(bridge: Pipeline, detector, settings: Settings, store) -> None:
+    """
+    Continuous capture from a local camera: a recorder with a live viewfinder.
+
+    The viewfinder runs as soon as this mode is selected, not only once
+    recording starts, so the camera can be aimed before anything is committed.
+    Nothing is inspected while it runs: detection takes seconds per frame, so a
+    preview built from inspected frames trails far behind where the camera is
+    actually pointing, and it would report the same physical board once per
+    frame besides. Start records; Stop hands the whole recording to
+    :func:`_render_live_recording_scan`, which inspects it one *board* at a
+    time.
+
+    Both the preview and the recording run in short chunks (see ``core.live``)
+    so the buttons stay responsive, and the camera handle is kept in session
+    state so it is opened once rather than once per chunk.
     """
     running = st.session_state.get("live_running", False)
 
@@ -1420,7 +1739,7 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
             st.dataframe(pd.DataFrame(live.probe_report()),
                          use_container_width=True, hide_index=True)
 
-    controls = st.columns([2, 2, 2, 1, 1])
+    controls = st.columns([3, 1, 1])
     with controls[0]:
         camera_index = st.selectbox(
             "Camera", cameras or [0],
@@ -1429,239 +1748,222 @@ def _live_stream(bridge: Pipeline, detector, settings: Settings, store) -> None:
             key="live_camera_index",
         )
     with controls[1]:
-        target_fps = st.slider(
-            "Inspections per second", 0.5, 10.0, 3.0, 0.5, disabled=running,
-            help="How often to run the full pipeline. Detection, not capture, "
-                 "sets the achievable ceiling — the measured rate is shown below.",
-        )
-    with controls[2]:
-        align_live = st.checkbox(
-            "Apply Module 2 alignment", value=True, disabled=running,
-            help="Each detected board is straightened in place before "
-                 "detection; several boards in view are handled together.",
-        )
-    with controls[3]:
         st.write("")
         st.write("")
         start = st.button("▶ Start", type="primary", use_container_width=True,
                           disabled=running or not cameras)
-    with controls[4]:
+    with controls[2]:
         st.write("")
         st.write("")
         stop = st.button("■ Stop", use_container_width=True, disabled=not running)
 
-    confirm_live = st.slider(
-        "Confirm a defect across analyses", 1, 5, 2, disabled=running,
-        help="A defect is reported only after it has been seen in this many "
-             "analyses of the same board, so one-off findings — usually flicker "
-             "at the confidence threshold — are dropped.",
+    preview_on = st.checkbox(
+        "Show the camera while idle", value=True, key="live_preview_on",
+        help="Keeps the viewfinder running before you start recording, so the "
+             "camera can be aimed. It holds the camera open and refreshes the "
+             "page continuously — turn it off to release the camera for "
+             "Snapshot mode or another program.",
     )
 
     if start:
         st.session_state["live_running"] = True
-        st.session_state["live_stats"] = live.LiveStats()
-        st.session_state["live_consensus"] = live.BoardAnchoredConsensus(
-            confirm=max(1, int(confirm_live))
-        )
-        st.session_state["live_capture"] = live.open_camera(int(camera_index))
+        # Frames are kept JPEG-encoded rather than raw: a raw 1280x720 frame is
+        # 2.7 MB, so a few minutes of them would exhaust memory long before the
+        # operator pressed Stop.
+        st.session_state["live_frames"] = []
+        st.session_state["live_recording"] = None
+        st.session_state["live_started_at"] = time.time()
+        st.session_state.pop("live_rec_scan_result", None)
         st.rerun()
 
     if stop:
         st.session_state["live_running"] = False
         live.close_camera(st.session_state.pop("live_capture", None))
+        _finalise_live_recording()
         st.rerun()
 
-    stats: live.LiveStats | None = st.session_state.get("live_stats")
+    running = st.session_state.get("live_running", False)
+    has_recording = bool(st.session_state.get("live_recording"))
+    # The idle viewfinder gives way to the results of a finished session —
+    # otherwise the page would keep re-running underneath them while they are
+    # being read. Pressing Start clears the recording and it comes back.
+    previewing = bool(cameras) and not running and preview_on and not has_recording
 
-    if running:
+    if running or previewing:
         capture = st.session_state.get("live_capture")
+        if capture is None:
+            capture = live.open_camera(int(camera_index))
+            st.session_state["live_capture"] = capture
         if capture is None:
             st.session_state["live_running"] = False
             st.error(
                 "The camera could not be opened. It is most likely held by "
                 "another program — Snapshot mode in this or another browser tab "
-                "keeps it open. Close those and press Start again.",
+                "keeps it open. Close those and try again.",
                 icon="⛔",
             )
             return
 
+        chip_class = "pcb-chip pcb-chip--ok" if running else "pcb-chip"
+        chip_text = "● RECORDING" if running else "● PREVIEW — not recording"
         st.markdown(
-            '<div class="pcb-chips"><span class="pcb-chip pcb-chip--ok">● LIVE</span></div>',
+            f'<div class="pcb-chips">'
+            f'<span class="{chip_class}">{chip_text}</span></div>',
             unsafe_allow_html=True,
         )
         frame_slot = st.empty()
         metric_slot = st.empty()
-        boards_slot = st.empty()
 
-        def on_frame(annotated, summary) -> None:
-            frame_slot.image(viz.to_rgb(annotated), use_container_width=True)
+        recording: list[bytes] = st.session_state.setdefault("live_frames", [])
+        started_at = st.session_state.get("live_started_at") or time.time()
+
+        def on_frame(frame) -> None:
+            """Show the frame as captured, and record it when recording."""
+            if running and len(recording) < LIVE_RECORD_MAX_FRAMES:
+                ok, buffer = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                )
+                if ok:
+                    recording.append(buffer.tobytes())
+            # Scaled down and handed over as JPEG **bytes**, not as an array.
+            # Streamlit encodes a numpy array to PNG, which for a 720px webcam
+            # frame measured 41 ms and 856 KB per frame — on its own that caps
+            # the viewfinder near 7 fps and makes it stutter. The same frame as
+            # JPEG is 1.9 ms and 218 KB, and bytes are passed straight through
+            # without re-encoding. cv2 encodes BGR directly, so this also drops
+            # the RGB conversion the array path needed.
+            frame_slot.image(
+                viz.encode_jpeg(viz.thumbnail(frame, LIVE_PREVIEW_WIDTH), quality=80),
+                use_container_width=True,
+            )
+
+        result = live.capture_chunk(capture, seconds=2.0,
+                                    max_fps=LIVE_PREVIEW_FPS, on_frame=on_frame)
+
+        if running:
+            elapsed = max(0.001, time.time() - started_at)
             with metric_slot.container():
-                columns = st.columns(4)
-                columns[0].metric("Verdict", summary.verdict)
-                columns[1].metric("Defects in frame", summary.total_defects)
-                columns[2].metric("Frames inspected", stats.frames)
-                columns[3].metric("Effective rate", f"{stats.effective_fps:.1f} /s")
+                columns = st.columns(3)
+                columns[0].metric("Frames recorded", len(recording))
+                columns[1].metric("Recording time", f"{elapsed:.0f} s")
+                columns[2].metric("Capture rate", f"{len(recording) / elapsed:.1f} /s")
+        else:
+            metric_slot.caption(
+                "Aim the camera at the boards, then select **Start** to record. "
+                "The recording is inspected board by board when you stop."
+            )
 
-        def on_boards(boards) -> None:
-            if boards:
-                boards_slot.markdown("&nbsp;·&nbsp;".join(
-                    f"**{board.label}** {board.verdict} — {board.defect_count} "
-                    f"defect(s)"
-                    for board in boards
-                ))
-            else:
-                boards_slot.caption("No board identified in this frame")
-
-        chunk = live.run_chunk(
-            capture,
-            bridge=bridge,
-            detector=detector,
-            stats=stats,
-            criteria=settings.criteria,
-            seconds=2.0,
-            target_fps=float(target_fps),
-            mode=settings.mode,
-            do_preprocess=settings.do_preprocess,
-            do_align=bool(align_live),
-            confirm_frames=int(confirm_live),
-            confidence=settings.confidence,
-            iou=settings.iou,
-            show_labels=settings.show_labels,
-            show_confidence=settings.show_confidence,
-            consensus=st.session_state.get("live_consensus"),
-            on_frame=on_frame,
-            on_boards=on_boards,
-        )
-
-        # Persist this chunk's frames in one write rather than one per frame.
-        if chunk.frames_processed:
-            recent = stats.timeline[-chunk.frames_processed:]
-            _log_live_chunk(store, stats, recent, detector.model_name)
-
-        if chunk.error:
+        if running and len(recording) >= LIVE_RECORD_MAX_FRAMES:
             st.session_state["live_running"] = False
             live.close_camera(st.session_state.pop("live_capture", None))
-            st.error(f"Capture stopped — {chunk.error}", icon="⛔")
+            _finalise_live_recording()
+            st.warning(
+                f"Recording stopped at the {LIVE_RECORD_MAX_FRAMES}-frame limit. "
+                "The recording is inspected below.",
+                icon="⚠️",
+            )
+            st.rerun()
+
+        if result.error:
+            st.session_state["live_running"] = False
+            live.close_camera(st.session_state.pop("live_capture", None))
+            _finalise_live_recording()
+            st.error(f"Capture stopped — {result.error}", icon="⛔")
             return
 
         st.rerun()
 
-    # -- session summary, shown while stopped ------------------------------- #
-    if stats is None or stats.frames == 0:
-        st.info("Select **Start** to begin inspecting the live camera feed.", icon="📷")
+    # Neither recording nor previewing: let go of the camera so Snapshot mode
+    # and other programs can have it.
+    live.close_camera(st.session_state.pop("live_capture", None))
+
+    if not has_recording:
+        st.info(
+            "Tick **Show the camera while idle** to see the camera, or select "
+            "**Start** to begin recording.",
+            icon="📷",
+        )
         return
 
-    _render_live_summary(stats, settings, detector)
+    _render_live_recording_scan(bridge, detector, settings, store)
 
 
-def _log_live_chunk(store, stats: live.LiveStats, recent: list[dict[str, Any]], model: str) -> None:
+
+def _finalise_live_recording() -> None:
     """
-    Write one chunk's frames to the history in a single call.
+    Turn the frames recorded during a live session into a video.
 
-    The timeline entries hold only what the chart needs, so the records written
-    here carry the headline figures rather than the full per-class breakdown;
-    that keeps a long live session from flooding the table.
+    Called the moment capture stops — by the Stop button or by the camera
+    failing — so the footage is ready to be inspected board by board without
+    the operator having to save and re-upload anything.
     """
-    if store is None or not getattr(store, "available", False) or not recent:
+    frames: list[bytes] = st.session_state.get("live_frames") or []
+    if not frames:
         return
-    try:
-        records = [
-            InspectionRecord(
-                source=f"live#frame_{entry['frame']}",
-                mode="live",
-                verdict=str(entry["verdict"]),
-                quality_score=float(entry["quality_score"]),
-                total_defects=int(entry["defects"]),
-                model=model,
-            )
-            for entry in recent
-        ]
-        store.log_many(records)
-    except Exception:                                        # noqa: BLE001
-        pass
+
+    decoded = []
+    for encoded in frames:
+        frame = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            decoded.append(frame)
+
+    # Stamp the recording with the rate it was actually captured at, so its
+    # timeline matches the wall clock of the session it came from.
+    started_at = st.session_state.get("live_started_at")
+    elapsed = (time.time() - started_at) if started_at else 0.0
+    fps = (len(decoded) / elapsed) if elapsed > 0.5 else LIVE_PREVIEW_FPS
+    st.session_state["live_recording"] = video.encode_frames(
+        decoded, fps=max(1.0, fps)
+    )
+    # The JPEGs have served their purpose; releasing them keeps a long session
+    # from holding the footage twice over.
+    st.session_state["live_frames"] = []
 
 
-def _render_live_summary(stats: live.LiveStats, settings: Settings, detector) -> None:
-    """Session totals shown once the live capture has been stopped."""
+def _render_live_recording_scan(bridge: Pipeline, detector, settings: Settings, store) -> None:
+    """
+    Inspect the just-finished live session board by board.
+
+    Streaming reports one verdict per *frame*, which means the same physical
+    board is reported over and over as it sits in view. Once the operator
+    stops, the whole recording is available at once, so it can be tracked
+    properly: each board is captured once at its most complete moment and put
+    through Modules 1-3 on its own — the same treatment an uploaded clip gets,
+    and the same one result per board.
+    """
+    recording: bytes | None = st.session_state.get("live_recording")
+    if not recording:
+        return
+
     st.divider()
-    section("Session summary")
-    columns = st.columns(5)
-    columns[0].metric("Frames inspected", stats.frames)
-    columns[1].metric("Pass rate", f"{stats.pass_rate:.1f}%")
-    columns[2].metric("Defects seen", stats.defects)
-    columns[3].metric("Effective rate", f"{stats.effective_fps:.1f} /s")
-    columns[4].metric("Mean inference", f"{stats.mean_inference_ms:.0f} ms")
-
-    if stats.worst_frame is not None:
-        section("Worst frame")
-        st.image(viz.to_rgb(stats.worst_frame), caption=stats.worst_caption,
-                 use_container_width=True)
-
-    left, right = st.columns([3, 2])
-    with left:
-        section("Defect timeline")
-        frame = pd.DataFrame(stats.timeline)
-        if not frame.empty:
-            st.line_chart(frame.set_index("time_s")[["defects", "quality_score"]], height=250)
-    with right:
-        section("Defect distribution")
-        class_bar_chart(stats.class_counts, "Detections per class across the session.")
-
-    section("Export")
-    frame = pd.DataFrame(stats.timeline)
-    batch = BatchSummary(
-        total_boards=stats.frames,
-        passed=stats.verdict_counts.get("PASS", 0),
-        review=stats.verdict_counts.get("REVIEW", 0),
-        failed=stats.verdict_counts.get("FAIL", 0),
-        total_defects=stats.defects,
-        mean_quality=(
-            sum(entry["quality_score"] for entry in stats.timeline) / len(stats.timeline)
-            if stats.timeline else 0.0
-        ),
-        mean_inference_ms=stats.mean_inference_ms,
-        class_counts=dict(stats.class_counts),
+    section("Board-by-board inspection of this session")
+    st.caption(
+        "The stream above reports one verdict per frame, so a board that stayed "
+        "in view was counted many times. This inspects the recording of the "
+        "session you just stopped, one *board* at a time instead."
     )
-    rows = [
-        {
-            "image": f"frame_{entry['frame']}",
-            "verdict": entry["verdict"],
-            "quality_score": entry["quality_score"],
-            "total_defects": entry["defects"],
-            "critical_defects": "",
-            "mean_confidence": "",
-        }
-        for entry in stats.timeline
-    ]
-    gallery = (
-        [(stats.worst_caption or "Worst frame", stats.worst_frame)]
-        if stats.worst_frame is not None else []
+
+    info = video.probe(recording)
+    columns = st.columns(4)
+    columns[0].metric("Frames recorded", info["frame_count"])
+    columns[1].metric("Frame rate", f"{info['fps']:.1f} fps")
+    columns[2].metric("Resolution", f"{info['width']}×{info['height']}")
+    columns[3].metric("Duration", f"{info['duration_s']:.1f} s")
+
+    st.download_button(
+        "⬇ Download this session's recording",
+        data=recording,
+        file_name="live_session.mp4",
+        mime="video/mp4",
+        key="live_recording_download",
     )
-    pdf_bytes, pdf_error = _build_pdf(
-        report.build_batch_report,
-        batch=batch,
-        rows=rows,
-        config=settings.as_config(detector.status()),
-        run_name="Live camera session",
-        gallery=gallery,
+
+    _render_board_scan(
+        recording, "live_session.mp4", bridge, detector, settings, store,
+        key_prefix="live_rec_scan", history_mode="live-board",
     )
-    if pdf_error:
-        st.warning(f"The PDF report could not be generated — {pdf_error}", icon="⚠️")
-
-    download_row([
-        ("📄 PDF session report", pdf_bytes, "live_session_report.pdf", "application/pdf"),
-        ("🖼 Worst frame (PNG)",
-         viz.encode_png(stats.worst_frame) if stats.worst_frame is not None else None,
-         "live_worst_frame.png", "image/png"),
-        ("📊 Timeline (CSV)",
-         frame.to_csv(index=False).encode("utf-8-sig") if not frame.empty else None,
-         "live_timeline.csv", "text/csv"),
-    ])
 
 
-# --------------------------------------------------------------------------- #
-# Page 5 — history
-# --------------------------------------------------------------------------- #
 def page_history(store, settings: Settings) -> None:
     """The yield dashboard: every board this system has ever inspected."""
     st.markdown("#### Inspection history")
@@ -1753,11 +2055,34 @@ def page_history(store, settings: Settings) -> None:
         )
 
     section("Records")
+    ordered = (filtered.sort_values("inspected_at", ascending=False)
+               if "inspected_at" in filtered.columns else filtered)
+    # Rows carry the URL of each stage's picture when the Supabase store was
+    # configured to keep them (docs/supabase_images.sql). Render those columns
+    # as thumbnails; every other store leaves them absent, so the table simply
+    # has fewer columns rather than needing a different code path.
+    image_columns = {
+        f"image_{stage}": st.column_config.ImageColumn(
+            stage.capitalize(), help=f"{stage.capitalize()} image kept for this board",
+        )
+        for stage in storage.IMAGE_STAGES
+        if f"image_{stage}" in ordered.columns
+    }
+    if image_columns:
+        # A column that is present but empty for every row is noise.
+        image_columns = {
+            name: config for name, config in image_columns.items()
+            if ordered[name].astype(str).str.strip().ne("").any()
+        }
     st.dataframe(
-        filtered.sort_values("inspected_at", ascending=False)
-        if "inspected_at" in filtered.columns else filtered,
-        use_container_width=True, hide_index=True, height=360,
+        ordered, use_container_width=True, hide_index=True, height=360,
+        column_config=image_columns or None,
     )
+    if image_columns:
+        st.caption(
+            "· The stage columns are the pictures kept for each board in "
+            "Supabase Storage. Select a cell to open one full size."
+        )
 
     # -- export and maintenance --------------------------------------------- #
     section("Export")
@@ -2096,8 +2421,14 @@ def _folder_picker(bridge: Pipeline, key: str) -> str:
     ).strip().strip('"')
 
 
-def _video_picker(bridge: Pipeline) -> Path | None:
-    """Offer the conveyor video that Module 1 generated, if it is present."""
+def _video_picker(bridge: Pipeline, key: str = "video_sample") -> Path | None:
+    """
+    Offer the conveyor video that Module 1 generated, if it is present.
+
+    Args:
+        key: widget key, so the Video and Live pages can each offer the picker
+            without sharing one selection.
+    """
     root = bridge.project_root
     if root is None:
         return None
@@ -2108,7 +2439,7 @@ def _video_picker(bridge: Pipeline) -> Path | None:
 
     with st.expander("…or use a video from the project"):
         names = [str(path.relative_to(root)) for path in videos]
-        chosen = st.selectbox("Project video", ["None"] + names, key="video_sample")
+        chosen = st.selectbox("Project video", ["None"] + names, key=key)
         if chosen == "None":
             return None
         return root / chosen

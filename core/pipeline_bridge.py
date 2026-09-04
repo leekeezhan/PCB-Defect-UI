@@ -48,6 +48,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .roi import board_polarity_ok
 from .workspace import dataset_folders as _dataset_folders
 from .workspace import repo_root, workspace_root
 
@@ -485,12 +486,30 @@ class PipelineBridge:
 
         # -- Module 2 ------------------------------------------------------ #
         if do_align:
-            aligned = self.align(working)
-            if aligned is None:
+            # Pre-flight: Module 2's corner finder assumes the board is the
+            # DARK side of an Otsu split. On a lit screen or a brightly-lit
+            # board over a dark bench that is inverted, and it warps the frame
+            # around whatever dark shape it traced instead — a different one
+            # almost every frame, which makes a live stream twist and jump.
+            # See core.roi.board_polarity_ok.
+            polarity_ok, polarity_reason = board_polarity_ok(working)
+            aligned = self.align(working) if polarity_ok else None
+
+            rejection: str | None = None
+            if not polarity_ok:
+                rejection = (
+                    f"Module 2 was skipped for this frame because {polarity_reason}. "
+                    "Put the board on a light background to align it."
+                )
+            elif aligned is None:
+                rejection = (
+                    "Module 2 could not resolve a four-corner board boundary."
+                )
+
+            if rejection is not None:
                 result.notes.append(
-                    "Module 2 could not resolve a four-corner board boundary — "
-                    "the frame was scaled to the detector's expected size "
-                    "instead of being aligned."
+                    f"{rejection} The frame was scaled to the detector's "
+                    "expected size instead of being aligned."
                 )
                 working = self._scale_to_align_target(working)
             else:

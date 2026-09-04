@@ -29,7 +29,9 @@ The Supabase table definition is in ``docs/supabase_schema.sql``.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import uuid
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -43,6 +45,24 @@ STORE_SUPABASE = "supabase"
 
 #: Default table / file names.
 DEFAULT_TABLE = "inspections"
+
+#: The stages a row can carry a picture for, in pipeline order. The name is
+#: both the InspectionRecord field suffix and the object-name suffix.
+IMAGE_STAGES = ("original", "preprocessed", "aligned", "annotated")
+
+#: Which bucket each stage is uploaded to. This follows the naming the rest
+#: of the team already uses in the shared project — the operator's input
+#: with the other uploads, both of Modules 1 and 2 outputs with the other
+#: processed images, and the detection result with the other annotated ones
+#: — so Module 4's pictures sit alongside everyone else's rather than in a
+#: bucket of their own. See docs/supabase_images.sql for the policies each
+#: bucket needs before the anon key may write to it.
+DEFAULT_BUCKETS = {
+    "original": "pcb-uploads",
+    "preprocessed": "pcb-processed",
+    "aligned": "pcb-processed",
+    "annotated": "pcb-annotated",
+}
 DEFAULT_SQLITE_NAME = "inspection_history.db"
 
 
@@ -72,6 +92,14 @@ class InspectionRecord:
     image_height: int = 0
     class_counts: dict[str, int] = field(default_factory=dict)
     inspected_at: str = ""
+
+    # Public URLs of the pictures kept for this board, empty when image
+    # upload is off, unsupported by the store, or the upload failed. See
+    # docs/supabase_images.sql.
+    image_original: str = ""
+    image_preprocessed: str = ""
+    image_aligned: str = ""
+    image_annotated: str = ""
 
     def __post_init__(self) -> None:
         if not self.inspected_at:
@@ -322,10 +350,21 @@ class SupabaseStore:
 
     kind = STORE_SUPABASE
 
-    def __init__(self, url: str | None, key: str | None, table: str = DEFAULT_TABLE) -> None:
-        self.url = (url or "").strip().rstrip("/")
+    def __init__(self, url: str | None, key: str | None, table: str = DEFAULT_TABLE,
+                 buckets: dict[str, str] | None = None) -> None:
+        # The dashboard shows the REST example URL with a "/rest/v1" suffix,
+        # which is easy to paste in by mistake. The client appends that part
+        # itself, so a URL kept verbatim would be requested as
+        # ".../rest/v1/rest/v1/..." and every call would fail; trim it here
+        # rather than making the operator spot it.
+        cleaned = (url or "").strip().rstrip("/")
+        for suffix in ("/rest/v1", "/rest"):
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)].rstrip("/")
+        self.url = cleaned
         self.key = (key or "").strip()
         self.table = table or DEFAULT_TABLE
+        self.buckets = {**DEFAULT_BUCKETS, **(buckets or {})}
         self.last_error: str | None = None
         self._client: Any = None
 
@@ -366,6 +405,52 @@ class SupabaseStore:
             "error": self.last_error,
             "note": "Hosted Postgres — history is shared across every machine running the system.",
         }
+
+    def upload_images(self, images: dict[str, bytes], name_hint: str = "board") -> dict[str, str]:
+        """
+        Put one board's pictures in the bucket and return their public URLs.
+
+        Args:
+            images: ``{stage: JPEG bytes}`` for any of :data:`IMAGE_STAGES`.
+                Each stage goes to its own bucket, per :data:`DEFAULT_BUCKETS`.
+            name_hint: the row's ``source``, used to build a readable object
+                name. Anything that is not a letter, digit, dash or underscore
+                is replaced, since the object name becomes part of a URL.
+
+        Returns:
+            ``{stage: public URL}`` for the pictures that uploaded. A stage
+            missing from the result simply has no picture: an upload failure is
+            recorded in ``last_error`` and never raised, because losing a
+            picture must not cost the inspection result it belongs to.
+        """
+        if not self.available or not images:
+            return {}
+
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", name_hint or "board").strip("_")[:60] or "board"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d/%H%M%S")
+        unique = uuid.uuid4().hex[:8]
+
+        urls: dict[str, str] = {}
+        for stage, data in images.items():
+            if not data or stage not in IMAGE_STAGES:
+                continue
+            name = self.buckets.get(stage)
+            if not name:
+                continue
+            path = f"{stamp}_{stem}_{unique}_{stage}.jpg"
+            try:
+                bucket = self._client.storage.from_(name)
+                bucket.upload(
+                    path, data,
+                    file_options={"content-type": "image/jpeg", "upsert": "true"},
+                )
+                urls[stage] = bucket.get_public_url(path)
+            except Exception as exc:                         # noqa: BLE001
+                self.last_error = (
+                    f"Could not upload '{path}' to bucket '{name}': "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return urls
 
     def log(self, record: InspectionRecord) -> bool:
         return self.log_many([record]) == 1
@@ -432,6 +517,7 @@ def create_store(
     supabase_url: str | None = None,
     supabase_key: str | None = None,
     table: str = DEFAULT_TABLE,
+    buckets: dict[str, str] | None = None,
 ):
     """
     Build the configured history store.
@@ -446,6 +532,8 @@ def create_store(
         supabase_url: project URL for the Supabase store.
         supabase_key: API key for the Supabase store.
         table: table name for the Supabase store.
+        buckets: stage-to-bucket overrides for the Supabase store; anything
+            left out falls back to DEFAULT_BUCKETS.
 
     Returns:
         A store exposing ``available``, ``status()``, ``log()``, ``log_many()``,
@@ -454,5 +542,5 @@ def create_store(
     if kind == STORE_SQLITE:
         return SQLiteStore(sqlite_path or DEFAULT_SQLITE_NAME)
     if kind == STORE_SUPABASE:
-        return SupabaseStore(supabase_url, supabase_key, table)
+        return SupabaseStore(supabase_url, supabase_key, table, buckets)
     return NullStore()
