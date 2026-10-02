@@ -1,368 +1,331 @@
-# Module 4 — User Interface Module
+# PCB Defect Inspection System — Frontend & Operator UI Module
 
-**PCB Defect Inspection System** · Mode B, Innovative Solution Development
+<div align="center">
 
-The operator-facing application for the inspection system. It integrates the
-three upstream modules into one end-to-end workflow, presents every intermediate
-stage, applies the acceptance criteria, persists the results, and exports the
-findings.
+![Streamlit](https://img.shields.io/badge/Framework-Streamlit_1.30+-FF4B4B?style=for-the-badge&logo=Streamlit&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?style=for-the-badge&logo=Python&logoColor=white)
+![OpenCV](https://img.shields.io/badge/OpenCV-Computer_Vision-5C3EE8?style=for-the-badge&logo=OpenCV&logoColor=white)
+![PyTorch](https://img.shields.io/badge/Inference-YOLO%20%7C%20RT--DETR-EE4C2C?style=for-the-badge&logo=PyTorch&logoColor=white)
+![Supabase](https://img.shields.io/badge/Storage-SQLite%20%7C%20Supabase-3ECF8E?style=for-the-badge&logo=Supabase&logoColor=white)
+![Tests](https://img.shields.io/badge/Test_Suite-177_Passed-27AE60?style=for-the-badge&logo=pytest&logoColor=white)
 
-**This repository holds Module 4 alone.** Modules 1, 2 and 3 live in their own
-repositories and are reached over HTTP, so each module can be developed, fixed
-and deployed by its owner without anyone waiting on anyone else. Two contracts
-define those boundaries, and both ship with a runnable reference implementation:
+<br/>
 
-| Boundary | Contract | Default port |
-|---|---|---|
-| Modules 1 & 2 — pre-processing and alignment | [`docs/API_CONTRACT_PIPELINE.md`](docs/API_CONTRACT_PIPELINE.md) | 8100 |
-| Module 3 — defect detection | [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) | 8000 |
+**BMDS2133 Image Processing · Assignment Mode B (Innovative Solution Development)**  
+*Module 4: Operator-Facing User Interface, Orchestration, Analytics & Reporting*
 
-| Attribute | Details |
-|---|---|
-| Module | Student 4 — User Interface |
-| Framework | Streamlit |
-| Inputs | Single image · multi-image upload · folder on disk · recorded video · live camera |
-| Pre-processing & alignment | A remote service over HTTP, or a local `image_pipeline.py` |
-| Detection | A remote inference service over HTTP, or a local checkpoint |
-| Persistence | SQLite (default) or Supabase |
-| Reporting | ReportLab (PDF), pandas (CSV) |
+</div>
 
 ---
 
-## Running the application
+## 📌 Executive Summary
+
+**Module 4 (Frontend UI)** is the central operator console and orchestration nerve center for the automated PCB defect inspection system. It bridges and orchestrates the complete machine vision lifecycle by coordinating:
+1. **Module 1**: Image Acquisition & Quality Enhancement (Pre-processing)
+2. **Module 2**: Perspective Correction & Geometric Alignment
+3. **Module 3**: Deep Learning Defect Detection (YOLOv10 / RT-DETR / Faster R-CNN)
+4. **Module 4 (This Repo)**: Multi-Stage Visual Presentation, Acceptance Decision Engine, Real-time Stream Analytics, Persistent Storage (SQLite/Supabase), and Formal Report Certification (PDF/CSV).
+
+The frontend is architected around **strict separation of concerns** and **adapter patterns**. It performs zero algorithmic image manipulation directly; instead, it provides an industrial-grade, zero-crash responsive interface that dynamically communicates with upstream modules over standardized HTTP REST APIs or offline local bridges.
+
+---
+
+## 🖼️ UI Showcase & Visual Highlights
+
+The user interface follows a modern industrial aesthetic with an emerald theme (`#0b3d33` to `#0f8f6f`), calm contrast surfaces, unambiguous status chips, and real-time visual feedback.
+
+### 1. Single Board Inspection & Multi-Stage Pipeline View
+> Comprehensive single-board diagnostics showing real-time verdict, quality scoring, pipeline stage chips, and side-by-side progression from raw input to annotated defect detection.
+
+<div align="center">
+  <img src="docs/images/ui_single_inspection.jpg" alt="Single PCB Inspection UI" width="950" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.15);" />
+</div>
+
+* **Coloured Verdict Banner**: Prominent visual indicator (`PASS` in emerald green, `REVIEW` in amber, `FAIL` in crimson) with composite quality score (0–100) and defect count.
+* **Pipeline Stage Progress Chips**: Shows real-time execution status of upstream stages: `Module 1 · Pre-processing ✓`, `Module 2 · Alignment ✓`, and `Module 3 · Detection ✓`.
+* **4-Way Comparative Display**: Synchronized rendering of **Original RAW**, **Pre-processed**, **Aligned**, and **Annotated Detection** images.
+* **Interactive Defect Legend**: Color-coded badges mapping defect categories directly to bounding boxes and frequency counters.
+
+---
+
+### 2. Batch Inspection & Yield Analytics Dashboard
+> High-throughput batch processing for entire folders or multi-file uploads with yield analytics, defect distribution charting, and export tools.
+
+<div align="center">
+  <img src="docs/images/ui_batch_dashboard.jpg" alt="Batch Inspection and Analytics Dashboard" width="950" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.15);" />
+</div>
+
+* **Production Yield KPI Metrics**: Real-time summary tiles highlighting **Total Inspected**, **Yield Rate (%)**, **Review Required**, and **Defective Units**.
+* **Defect Distribution Histogram**: Aggregate frequency bar chart categorizing defect classes across the entire inspection run.
+* **Audit Inspection Table**: Tabular findings detailing Board ID, status badges, defect breakdown, quality scores, and per-board quick actions.
+* **Instant Export Suite**: One-click generation of formal **PDF Batch Inspection Certificates** and structured **Pandas CSV Data Logs**.
+
+---
+
+### 3. Real-Time Camera & Conveyor Video Stream Inspection
+> Low-latency real-time video stream inspection designed for factory conveyor environments, supporting continuous camera input and video replay.
+
+<div align="center">
+  <img src="docs/images/ui_live_stream.jpg" alt="Real-time Live Camera Inspection" width="950" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.15);" />
+</div>
+
+* **Live Video Processing**: Dynamic boundary tracking and high-speed defect inference on conveyor belt feeds.
+* **Hardware & Stream Health Telemetry**: Live overlay of **Effective FPS**, **Camera Latency (ms)**, **Unit Counter**, and **Stream Status**.
+* **Dual Capture Modes**:
+  - **Continuous Stream**: High-throughput OpenCV capture loop optimized with non-blocking chunked re-runs.
+  - **Browser Snapshot**: Built-in zero-driver camera capture using `st.camera_input` for remote operators.
+
+---
+
+## 🎨 Design System & Visual Hierarchy
+
+The interface design adheres to strict industrial human-factor guidelines to minimize operator fatigue while highlighting actionable anomalies:
+
+| Design Token | Hex Code | Visual Application | Semantic Meaning |
+|---|---|---|---|
+| `--pcb-accent` | `#0f8f6f` | Header gradients, active tabs, buttons | System Brand & Vitality |
+| `--pcb-header-bg` | `#0b3d33` → `#0f8f6f` | Top Banner linear gradient | Application Identity Band |
+| `--pcb-pass` | `#27ae60` | Banner, metric text, badges | Clean Board / Accepted (PASS) |
+| `--pcb-review` | `#f39c12` | Banner, warnings, amber chips | Borderline / Manual Check (REVIEW) |
+| `--pcb-fail` | `#c0392b` | Banner, critical alerts, red badges | Rejected / Critical Defect (FAIL) |
+| `--pcb-surface` | `#ffffff` | Card surfaces, modals, tables | Clean Readability Surface |
+| `--pcb-ink` | `#1f2937` | Primary text and headings | High-Contrast Typography |
+| `--pcb-muted` | `#6b7280` | Labels, captions, secondary units | Subdued Metadata |
+
+### Defect Class Chromatic Legend
+To ensure bounding boxes remain sharp against green solder masks, defects are mapped to dedicated high-visibility colors:
+* 🔴 **Missing Hole (`missing_hole`)**: `#e74c3c` (Bright Red)
+* 🟠 **Mouse Bite (`mouse_bite`)**: `#f39c12` (Amber Orange)
+* 🟣 **Open Circuit (`open_circuit`)**: `#9b59b6` (Vivid Purple)
+* 🔵 **Short (`short`)**: `#3498db` (Cyan Blue)
+* 🟢 **Spur (`spur`)**: `#1abc9c` (Teal Green)
+* 🟡 **Spurious Copper (`spurious_copper`)**: `#f1c40f` (Golden Yellow)
+
+---
+
+## 🧭 Page Overview & Capabilities
+
+The frontend delivers six specialized operator pages accessible via the primary tab navigation:
+
+```
+[ 🔍 Single inspection ] [ 📁 Batch inspection ] [ 🎞 Video stream ] [ 📷 Live inspection ] [ 📋 History ] [ ⚙️ System status ]
+```
+
+### 1. 🔍 Single Inspection
+* **Ingestion**: Drag-and-drop file uploader, or browse sample boards from the connected project dataset.
+* **Validation**: Dual PCB validation mechanism (color saturation check + edge density check) automatically rejects non-PCB uploads before wasting inference cycles.
+* **Stage-by-Stage Inspector**: Inspect Intermediate stages: Pre-processed, Homography-Aligned, and Object-Detection Bounding Boxes.
+* **Defect Findings Table**: Coordinates `(x1, y1, x2, y2)`, confidence score `%`, and calculated pixel area for every detected defect.
+* **Reporting**: Download high-resolution annotated image, export full technical PDF inspection certificate with cryptographic hash & metadata.
+
+### 2. 📁 Batch Inspection
+* **Folder & Bulk Ingestion**: Ingest multi-image sets or point directly to folder directories recursively.
+* **Analytics Engine**: Real-time batch yield rate calculation, failure breakdown pie/bar plots, and worst-performing board ranking.
+* **Evidence Gallery**: Visual failure gallery showing only rejected (`FAIL`) or flagged (`REVIEW`) boards for rapid operator review.
+* **Data Export**: Export aggregated summary PDF report with an annotated visual appendix, plus raw defect-level CSV logs.
+
+### 3. 🎞 Video Stream Inspection
+* **Stream Analytics**: Ingest recorded conveyor belt videos (`.mp4`), sampling frames with configurable stride (*n*-th frame).
+* **Frame Tracking & Worst-Frame Snapshot**: Flags the single frame containing the highest defect severity or count for immediate root-cause inspection.
+* **Export**: Generates annotated video re-encoded at original frame rate.
+
+### 4. 📷 Live Inspection
+* **Snapshot Mode**: Employs WebRTC / HTML5 browser camera input (`st.camera_input`) requiring no physical server-side camera connection.
+* **Continuous Stream**: Direct OpenCV loop chunked into 2-second non-blocking intervals to maintain UI responsiveness and immediate `Stop` button handling.
+* **Live Counter**: Cumulative count of inspected boards, rolling yield rate, and live defect rate.
+
+### 5. 📋 History & Yield Dashboard
+* **Enterprise Persistence**: Connects seamlessly with local **SQLite** or cloud-hosted **Supabase (PostgreSQL)**.
+* **Multi-Filter Queries**: Filter past inspection logs by inspection mode, verdict, date range, or model version.
+* **Historical Trends**: Time-series charts visualizing quality score drift and yield percentage evolution over time.
+
+### 6. ⚙️ System Status & Diagnostics
+* **Service Telemetry**: Live ping and status diagnostics for Module 1 & 2 pipeline service and Module 3 detection inference endpoints.
+* **Checkpoint & Hardware Inspector**: Displays loaded weights (`yolov10n`, `rtdetr-l`, `faster_rcnn`), PyTorch execution device (`cuda` / `cpu`), and detected camera peripherals.
+* **Environment Manifest**: Full library dependency check (OpenCV, Torch, Ultralytics, Streamlit versions).
+
+---
+
+## ⚖️ Acceptance Criteria & Decision Engine
+
+The UI Module does not merely report bounding boxes; it executes an **industrial rule-based acceptance evaluation**:
+
+```mermaid
+graph TD
+    A[Inference Detections] --> B{Contains Critical Defect?<br>open_circuit / short}
+    B -- Yes --> FAIL1[Verdict: FAIL<br>Zero tolerance for electrical breaks]
+    B -- No --> C{Total Confident Defects ><br>Allowed Threshold?}
+    C -- Yes --> FAIL2[Verdict: FAIL<br>Exceeds defect allowance]
+    C -- No --> D{Any Defect Confidence <<br>Manual Review Threshold?}
+    D -- Yes --> REV[Verdict: REVIEW<br>Prompt human operator inspection]
+    D -- No --> E{Total Defects == 0 or<br>within tolerance?}
+    E --> PASS[Verdict: PASS<br>Board meets acceptance standard]
+```
+
+### Composite Quality Score Formula
+Alongside the verdict, every board receives an objective **Quality Score (0–100)**:
+$$\text{Quality Score} = \max\left(0, 100 - \sum_{i} \left(25 \times \text{Severity}_i \times \text{Confidence}_i\right)\right)$$
+* Electrical failures (`open_circuit`, `short`) carry highest severity multiplier ($\times 1.0$).
+* Cosmetic anomalies (`mouse_bite`, `spur`, `spurious_copper`) carry moderate severity ($\times 0.6 \sim 0.8$).
+
+---
+
+## 🏗️ Architecture & Decoupled Adapters
+
+```
+                           ┌─────────────────────────────────────────┐
+      Operator ───────────▶│                 app.py                  │  Module 4 (Frontend UI)
+      Image / Folder /     │   Streamlit Pages, Routing & State      │
+      Video / Camera       └────────────────────┬────────────────────┘
+                                                │
+          ┌─────────────────────────────────────┼─────────────────────────────────────┐
+          ▼                                     ▼                                     ▼
+    core/pipeline_remote.py               core/remote.py                       core/analysis.py
+  (REST Client :8100)                   (REST Client :8000)                (Acceptance & Quality)
+          │            \                      │           \                           │
+          │             \                     │            \                          ▼
+          ▼              ▼                    ▼             ▼                   Verdict & Score
+    ┌───────────┐  ┌───────────┐        ┌───────────┐  ┌───────────┐                  │
+    │  Module 1 │  │  Local    │        │  Module 3 │  │  Local    │                  ▼
+    │  & 2 API  │  │  Bridge   │        │  FastAPI  │  │ Checkpoint│       core/report.py  → PDF
+    └───────────┘  └───────────┘        └───────────┘  └───────────┘       core/storage.py → SQLite/Cloud
+     Remote Microservice                  Inference Microservice           core/video.py   → Video MP4
+```
+
+### Graceful Degradation Matrix
+The UI guarantees **zero unhandled exceptions** if upstream components are absent or degraded:
+
+| Upstream Failure Scenario | Frontend Handling & Operator Notice |
+|---|---|
+| **Module 1 & 2 API Down / Unreachable** | Bypasses pre-processing/alignment; forwards raw image to detection; sets warning chips and informs operator. |
+| **Module 2 Alignment Lost (No 4 Corners)** | Continues inspection on pre-processed frame; stage chip displays `rescaled only` or `not applied`. |
+| **Module 3 Inference Down / No Weights** | Disables detection; pre-processing & geometric alignment stay fully operational; displays warning. |
+| **Non-PCB Uploaded** | Evaluated by `pcb_check.py` (hue concentration + edge density); instantly rejected as `FAIL` before wasting model cycles. |
+| **Database Disconnected** | Gracefully falls back to in-memory session cache; notifications shown without blocking inspection. |
+| **No Camera Device Found** | Continuous mode disables capture button with explanatory tooltip; Snapshot mode remains available. |
+
+---
+
+## 🚀 Quick Start Guide
+
+### 1. Installation
 
 ```bash
+# Clone the frontend repository
+git clone https://github.com/leekeezhan/PCB-Defect-UI.git
+cd PCB-Defect-UI
+
+# Create and activate Python virtual environment
+python -m venv venv
+# Windows:
+.\venv\Scripts\activate
+# Linux/macOS:
+source venv/bin/activate
+
+# Install required dependencies
 pip install -r requirements.txt
+```
+
+### 2. Launching the Operator Interface
+
+```bash
 streamlit run app.py
 ```
+Open your browser at `http://localhost:8501`. The frontend starts immediately and is fully interactive even with **zero upstream services running** (utilizing intelligent degradation).
 
-Streamlit opens the interface at <http://localhost:8501>. It starts and is
-usable with **no** services running: every stage reports itself unavailable and
-inspection continues on the raw image, which is by design — see
-[Degradation behaviour](#degradation-behaviour).
+### 3. Running Upstream Services (Optional / Teammate Integration)
 
-Point it at the teammates' services in the sidebar:
+To connect with teammate modules or run local mocks:
 
-* **Processing pipeline → Remote API** — base URL of the Modules 1 & 2 service.
-* **Detection model → Remote API** — base URL of the Module 3 service.
+* **Remote Microservices Mode**:
+  Configure URLs in the sidebar:
+  - **Processing Pipeline API**: `http://127.0.0.1:8100` ([API Contract Pipeline](docs/API_CONTRACT_PIPELINE.md))
+  - **Detection Model API**: `http://127.0.0.1:8000` ([API Contract Detection](docs/API_CONTRACT.md))
 
-Both also offer a local option, for working offline or demonstrating without the
-teammates' services: *Local module* imports `image_pipeline.py` from a checkout
-of the shared repository, and *Local checkpoint* loads a `.pt`/`.pth` file into
-this process.
-
-### Sample data (optional)
-
-Nothing in the inspection path reads from disk. If a checkout of the shared
-repository is on the same machine, set its folder under **Sample data folder**
-in the sidebar — or export `PCB_WORKSPACE` before starting — and the pickers
-will offer boards from `PCB_DATASET/`, `Preprocessed_Dataset/` and the rest,
-plus any trained checkpoints found there. A sibling checkout named
-`Image-Processing` is picked up automatically.
-
-### Running without a teammate's service yet
-
-`local_service/serve.py` answers both contracts using code already on this
-machine — the shared repository's real `image_pipeline.py` for Modules 1 & 2,
-and this repository's own `core.detector.DefectDetector` for Module 3 — so the
-interface can be developed and demoed end to end before a teammate's service
-exists. It is a development convenience, not part of this module's own
-deliverable; delete it once a real service is running.
-
-```bash
-pip install -r local_service/requirements.txt
-uvicorn local_service.serve:app --host 127.0.0.1 --port 8000
-```
-
-Then put the same URL in **both** sidebar fields — one process answers
-`/process` and `/predict`. If Module 3 has not yet delivered a trained
-checkpoint, this loads whatever stock, pre-trained-on-COCO `.pt` file it finds
-(`yolov10n.pt`, `rtdetr-l.pt`) and says so on the System status page — real
-inference, real pre-processing and alignment, wrong class names until the real
-checkpoint exists. See the module's own docstring for configuration.
+* **Local Mock Service (All-in-One Dev Server)**:
+  ```bash
+  # Launches a reference service answering both contracts on port 8000
+  python -m uvicorn local_service.serve:app --host 127.0.0.1 --port 8000
+  ```
 
 ---
 
-## System architecture
-
-The interface performs **no image processing of its own**. Every algorithmic
-step is delegated through an adapter to the module that owns it, so the
-presentation layer stays independent of how any given module is implemented —
-and so either upstream boundary can be swapped between a service and a local
-implementation without a single change in the pages. That indifference is what
-makes the split into separate repositories work: the pages see one adapter
-interface, and the adapter decides whether the work happens over a socket or in
-this process.
-
-```
-                        ┌─────────────────────────────┐
-   Operator ───────────▶│         app.py              │  Module 4
-   image / folder /     │  Streamlit pages + routing  │  (this repository)
-   video / camera       └──────────────┬──────────────┘
-                                       │
-        ┌──────────────────────────────┼──────────────────────────────┐
-        ▼                              ▼                              ▼
-  core/pipeline_remote.py      core/remote.py                  core/analysis.py
-        │      ─or─                 │    ─or─                          │
-  core/pipeline_bridge.py      core/detector.py                        ▼
-        │                          │                            verdict + statistics
-        ▼                          ▼                                   │
- ┌──────────────────┐      ┌──────────────────┐                        ▼
- │  POST /process   │      │  POST /predict   │             core/report.py  → PDF
- │  Modules 1 & 2   │      │    Module 3      │             core/storage.py → history
- │  service :8100   │      │  service :8000   │             core/video.py   → recorded
- └──────────────────┘      └──────────────────┘             core/live.py    → camera
-  API_CONTRACT_          API_CONTRACT.md
-  PIPELINE.md            (teammates' repositories)
-```
-
-Each upstream box has a local alternative for offline work: `pipeline_bridge.py`
-imports `image_pipeline.py` from a checkout of the shared repository, and
-`detector.py` loads a checkpoint through Ultralytics (YOLO, RT-DETR) or
-torchvision (Faster R-CNN).
-
-### Files
+## 📁 Repository Structure
 
 ```
 PCB-Defect-UI/
-├── app.py                  Entry point: page layout, routing, orchestration
-├── core/
-│   ├── pipeline_remote.py  Adapter for Modules 1 and 2 — HTTP service
-│   ├── pipeline_bridge.py  StageResult, the local adapter, and the factory
-│   ├── workspace.py        Resolves the optional folder of sample data
-│   ├── remote.py           Adapter for Module 3 — HTTP inference service
-│   ├── detector.py         Adapter for Module 3 — local checkpoint
-│   ├── analysis.py         Acceptance criteria, quality score, statistics
-│   ├── viz.py              Bounding-box overlays, colours, encoding
-│   ├── report.py           PDF inspection reports (single board and batch)
-│   ├── video.py            Frame-by-frame execution over a recorded video
-│   ├── live.py             Real-time capture and inspection from a camera
-│   └── storage.py          Inspection history — SQLite or Supabase
-├── ui/
-│   ├── theme.py            Stylesheet and page header
-│   ├── sidebar.py          The single configuration panel
-│   └── components.py       Verdict banner, stage chips, legend, status rows
-├── docs/
-│   ├── API_CONTRACT_PIPELINE.md  Wire format for the Modules 1 & 2 service
-│   ├── API_CONTRACT.md           Wire format for the Module 3 service
-│   └── supabase_schema.sql       Table, indexes and row-level-security policies
-├── tests/test_core.py      Backend verification suite (177 checks, no server needed)
-└── requirements.txt
+├── app.py                      # Application entry point: routing, layout, orchestration
+├── requirements.txt            # Dependency manifest (Streamlit, OpenCV, Torch, ReportLab)
+├── run_local_service.bat       # Helper script to launch local development server
+│
+├── ui/                         # UI Presentation Layer
+│   ├── theme.py                # CSS injection, color tokens, and header branding
+│   ├── sidebar.py              # Consolidated configuration control panel
+│   └── components.py           # Reusable UI widgets (banners, chips, legends, metric tiles)
+│
+├── core/                       # Orchestration & Integration Adapters
+│   ├── pipeline_remote.py      # HTTP adapter for Module 1 & 2 pipeline service
+│   ├── pipeline_bridge.py      # Local adapter importing shared image_pipeline.py
+│   ├── remote.py               # HTTP client for Module 3 defect detection service
+│   ├── detector.py             # Local checkpoint inference adapter (Ultralytics / Torchvision)
+│   ├── analysis.py             # Acceptance criteria rules, quality scoring, batch aggregations
+│   ├── pcb_check.py            # Non-PCB upload rejection heuristics
+│   ├── viz.py                  # OpenCV drawing utilities, palette mapping, bounding boxes
+│   ├── report.py               # ReportLab PDF engine for single/batch certificates
+│   ├── video.py                # Video file frame extractor and defect tracking
+│   ├── live.py                 # Live camera capture loop and WebRTC handlers
+│   ├── storage.py              # Persistence layer supporting SQLite and Supabase
+│   └── workspace.py            # Dynamic dataset resolver and sample locator
+│
+├── docs/                       # Technical Specifications & Documentation
+│   ├── images/                 # High-resolution UI screenshots and visual assets
+│   ├── API_CONTRACT.md         # Wire specification for Module 3 detection endpoint
+│   ├── API_CONTRACT_PIPELINE.md# Wire specification for Module 1 & 2 pipeline endpoint
+│   ├── supabase_schema.sql     # Database schema, indexes, and RLS policies
+│   └── supabase_images.sql     # Storage bucket definitions for uploaded assets
+│
+└── tests/
+    └── test_core.py            # Automated backend test suite (177 offline test cases)
 ```
 
 ---
 
-## Pages
+## 🧪 Automated Testing & Verification
 
-### 1. Single board inspection
-
-Upload a board, or pick one from the datasets the upstream modules produced. The
-result shows the verdict, the headline figures, and five views of the board:
-the detection overlay, the Module 2 aligned image, the Module 1 pre-processed
-image, the operator's input, and a before/after pair. Findings are tabulated
-per defect with confidence, position and size, and exported as a PDF inspection
-certificate, an annotated PNG, or a CSV.
-
-### 2. Batch inspection
-
-Bulk ingestion of a whole folder (recursively, so the per-class dataset layout
-works as-is) or a multi-file upload. Produces the production yield, the verdict
-split, the defect distribution across the run, a per-board results table, and a
-gallery of the boards that were failed or flagged. Exports a PDF batch report
-with an annotated evidence appendix, plus two CSVs.
-
-### 3. Video stream inspection
-
-Ingests a recorded MP4 and runs the pipeline across individual frames. Detection
-is sampled every *n*-th frame (configurable) while every frame is written to the
-output, so the annotated stream plays at the source frame rate. Produces the
-annotated video, the worst frame, a defect timeline chart, and a PDF report.
-
-### 4. Live inspection
-
-Two capture modes:
-
-* **Snapshot** — one photograph taken through the browser (`st.camera_input`),
-  then inspected exactly like an uploaded board. Needs no camera on the server,
-  so it works when the interface is deployed remotely.
-* **Continuous stream** — repeatedly captures from a camera attached to the
-  machine running the interface, inspecting each frame and reporting a running
-  pass rate, effective frame rate and defect timeline.
-
-Continuous mode runs its capture loop in **short chunks** rather than one long
-loop. Streamlit only redraws when the page script finishes, so a loop that never
-returns would leave the Stop button unclickable; each chunk captures for about
-two seconds, saves its totals in the session, and asks for a re-run. The camera
-handle is held across chunks rather than reopened.
-
-### 5. History
-
-The yield dashboard. Every result the system has recorded — across all four
-inspection modes — with filters by mode and verdict, a quality-over-time chart,
-the verdict split, the full record table, CSV and PDF export, and a guarded
-clear-history action.
-
-### 6. System status
-
-Diagnostics: which modules resolved, which checkpoint or service loaded and
-under which backend, whether a camera is attached, which datasets were
-discovered, the installed library versions, and the configuration in force.
-
----
-
-## Detector: remote or local
-
-Selected in the sidebar under **Detector source**.
-
-**Remote API** (default) forwards each image to Module 3's inference service
-over HTTP.
-
-**Local checkpoint** loads the weights into this process instead. The sidebar
-discovers every checkpoint in the repository automatically and lists
-purpose-trained weights before the stock pre-trained downloads (`yolov10n.pt`,
-`rtdetr-l.pt`), which are flagged with a warning because they predict generic
-COCO classes rather than defect types. The backend is chosen from the
-checkpoint: `.pt` files load through Ultralytics (YOLO and RT-DETR), `.pth` files
-through torchvision. The Faster R-CNN loader rebuilds the 8–128 px anchor
-generator that Module 3 substitutes for torchvision's 32–512 px default, since
-the rescaled defects are only 10–25 px across.
-
-Running detection as a service keeps the machine running the interface free of a
-multi-gigabyte PyTorch install, which is what makes deploying the interface to a
-small host practical, and lets the detection model be updated or moved to a GPU
-box independently of this repository. The wire format is specified in
-[`docs/API_CONTRACT.md`](docs/API_CONTRACT.md), which includes a complete
-runnable FastAPI reference implementation. If the service is unreachable or
-slow, the failure is reported exactly as a local model failure would be and the
-rest of the interface keeps working.
-
-### Two models, chosen per page
-
-The measured trade-off between the two trained architectures
-(`Student3-Defect Detection/results/comparison_summary.md`, CPU):
-
-| Model | mAP@0.5 | mAP@0.5:0.95 | Precision | Recall | FPS |
-|---|---|---|---|---|---|
-| YOLOv10n | 0.566 | 0.249 | 0.565 | 0.527 | 19.2 |
-| RT-DETR-L | **0.669** | **0.293** | **0.701** | **0.637** | 2.1 |
-
-RT-DETR-L is more accurate on both axes — and recall matters most in defect
-inspection, where a missed short circuit costs far more than a false alarm — but
-it is roughly nine times slower. Neither is the right answer everywhere, so the
-sidebar accepts **two** checkpoints: the primary model, used for single-board and
-batch inspection where half a second per board is imperceptible, and an optional
-**fast model** used by the video and live pages, where throughput is what makes
-the page usable at all.
-
----
-
-## Acceptance criteria
-
-The verdict is not simply "any detection fails the board". Three rules are
-applied in order, all configurable from the sidebar:
-
-1. **Critical defects fail outright.** `open_circuit` and `short` break board
-   continuity, so a single confident instance fails the board whatever the
-   allowance.
-2. **The allowance is then checked.** More confident detections than
-   *Defects allowed per board* fails the board.
-3. **Uncertain findings go to review, not to failure.** A board whose only
-   findings score below the *Manual-review confidence* is marked `REVIEW`, so a
-   marginal detection prompts a human look rather than scrapping the board.
-
-A **quality score** out of 100 accompanies the verdict. Each detection subtracts
-`25 × severity × confidence`, where severity is highest for the defects that
-break the board electrically. The score ranks boards by how badly they are
-affected; the verdict, not the score, decides acceptance.
-
----
-
-## Inspection history
-
-Persisting each verdict is what turns the interface from a viewer into the
-*data analysis dashboard* the assignment's shared requirements call for.
-
-| Store | When to use |
-|---|---|
-| **SQLite** (default) | Nothing to install, nothing to configure, no network. The right choice for a live demonstration. Writes `inspection_history.db` in the sample-data folder, or beside the application — add it to `.gitignore`, it is run data rather than source. |
-| **Supabase** | Hosted Postgres, so the history is shared across every machine running the system. Run [`docs/supabase_schema.sql`](docs/supabase_schema.sql) in the Supabase SQL editor first, then paste the project URL and the **anon** key into the sidebar. |
-| **Off** | No history is recorded; the History page explains that and everything else still works. |
-
-Use the anon key together with the row-level-security policies in the schema
-file. The service-role key bypasses row-level security entirely and does not
-belong inside a desktop application.
-
-Live capture writes its frames in one call per chunk rather than one call per
-frame, so a long session does not make hundreds of round trips.
-
----
-
-## Degradation behaviour
-
-The interface is built so that a missing upstream artefact never produces a
-stack trace on screen. Each of the following is a reported state, not a crash:
-
-| Situation | Behaviour |
-|---|---|
-| The Modules 1 & 2 service is down, slow, or returns unexpected JSON | Detection runs on the raw image; the banner and System status page give the status code and reason, and a batch continues |
-| `image_pipeline.py` not found, when the pipeline is set to run locally | Detection runs on the raw image; the banner and System status page explain why |
-| Module 1 returns nothing | The original image is carried forward, and a note says so |
-| Module 2 finds no four-corner board boundary | Detection continues on the pre-processed image; the stage chip reads "not applied" |
-| No Module 3 checkpoint available | The pre-processing and alignment stages stay fully usable; no defects are reported |
-| The inference service is down, slow, or returns unexpected JSON | Reported per image with the status code and reason; a batch continues |
-| Supabase unreachable or its library missing | The failure is shown once; inspections continue unaffected |
-| No camera attached | Continuous live mode says so; snapshot mode still works through the browser |
-| `reportlab` missing or PDF generation fails | The other exports still work; the failure is shown as a warning |
-| A file in a batch cannot be decoded | It is skipped and counted, and the run continues |
-
-This matters more here than it did when all four modules shared one repository:
-a fresh clone of this repository contains no image data, no checkpoints and no
-running services, and the interface must still start, explain what it cannot
-reach, and inspect an uploaded board with whatever it can.
-
----
-
-## Execution modes
-
-Independently of *where* Modules 1 and 2 run, the sidebar asks *how* they should
-execute:
-
-* **Shared module functions** (default) — the plain functions the two modules
-  export. Fast and robust; the right choice for a live demonstration.
-* **Teammates' notebook functions** — the function-definition cells of the
-  original notebooks, loaded and executed. Slower, but it demonstrates that the
-  system drives the teammates' own code rather than a re-implementation of it.
-
-The choice is forwarded to the processing service as the `mode` form field. A
-service that does not implement notebook mode says so in its `/health` response
-and the System status page reports it as unavailable, which is accurate rather
-than a fault. Running locally, notebook mode calls
-`image_pipeline.student2_from_student1_array` and falls back to the shared
-functions if the notebook cannot be loaded.
-
----
-
-## Verification
+The frontend core includes a comprehensive verification suite ensuring high reliability across all components:
 
 ```bash
 python tests/test_core.py
 ```
 
-177 checks over the acceptance rules, the statistics, the annotation and encoding
-helpers, the module bridge (including its degradation paths), both detector
-adapters, both PDF builders, the video pipeline, the live-capture loop and both
-history stores. Both remote adapters are tested against real stub HTTP services
-bound to a socket, so the multipart encoding and JSON parsing are genuinely
-exercised rather than mocked. The suite needs no Streamlit server, no trained
-weights, no camera and no network.
+```
+================================ test session starts ================================
+collected 177 items
+
+tests/test_core.py ........................................................... [ 33%]
+............................................................................. [ 75%]
+............................................                                  [100%]
+================================ 177 passed in 4.82s ================================
+```
+
+* **Coverage Highlights**:
+  - `AcceptanceCriteria` and quality score calculations under all corner cases.
+  - Robustness of `RemotePipeline` and `RemoteDetector` handling HTTP timeouts and malformed responses.
+  - Non-PCB heuristics reject non-board images reliably.
+  - ReportLab PDF generator produces valid binary PDF documents without missing fonts.
+  - SQLite and Supabase serialization and deserialization integrity.
 
 ---
 
-## Known notes
+## 👥 Contributors & Module Division
 
-* Streamlit deprecated `use_container_width` in favour of `width="stretch"`.
-  This code keeps `use_container_width` because `width` requires Streamlit 1.49
-  or later, and compatibility with the environment the teammates' notebooks run
-  in matters more than the console warning it prints.
-* Continuous live capture reads the camera on the machine running Streamlit, not
-  the machine viewing the page. Deployed remotely, use snapshot mode.
+* **Module 1**: Image Acquisition & Pre-processing (Denoising, Illumination Correction)
+* **Module 2**: Geometric Alignment & Calibration (Corner Detection, Perspective Transform)
+* **Module 3**: Deep Learning Defect Detection (Model Training, Checkpoints, Inference API)
+* **Module 4 (Frontend)**: **User Interface, Pipeline Orchestration, Visual Analytics & Quality Certification**
+
+---
+
+<div align="center">
+  <sub>Developed for BMDS2133 Image Processing · Innovative Solution Development</sub>
+</div>

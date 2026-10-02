@@ -307,7 +307,7 @@ def test_report() -> None:
     )
     check(single.startswith(b"%PDF"), "the single-board report is a valid PDF")
     check(len(single) > 20_000, f"the single-board report embeds its images ({len(single)} bytes)")
-    Path("/tmp/report_single.pdf").write_bytes(single)
+    (Path(tempfile.gettempdir()) / "report_single.pdf").write_bytes(single)
 
     empty_summary = analysis.summarise(DetectionResult([], 8.0, (512, 512), "best.pt"))
     clean = report.build_single_report(board, empty_summary, [], config, "board_02.jpg")
@@ -322,7 +322,7 @@ def test_report() -> None:
     )
     check(batch_pdf.startswith(b"%PDF"), "the batch report is a valid PDF")
     check(len(batch_pdf) > 10_000, f"the batch report has content ({len(batch_pdf)} bytes)")
-    Path("/tmp/report_batch.pdf").write_bytes(batch_pdf)
+    (Path(tempfile.gettempdir()) / "report_batch.pdf").write_bytes(batch_pdf)
 
     empty_batch = report.build_batch_report(
         analysis.summarise_batch([]), [], config, "Empty run"
